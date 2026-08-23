@@ -68,7 +68,7 @@ export function themeTools(ctx: ToolContext) {
       schema: { site_id: siteIdSchema, stylesheet: z.string().describe("Theme directory name, e.g. \"twentytwentyfour\".") },
       handler: async ({ site_id, stylesheet }) => {
         const client = site(site_id);
-        const res = await client.get<any>(`/wp/v2/themes/${encodeURIComponent(stylesheet)}`, { context: "edit" });
+        const res = await client.get<any>(`/wp/v2/themes/${stylesheet}`, { context: "edit" });
         return ok({ ...shapeTheme(res.data), theme_supports: res.data.theme_supports });
       },
     }),

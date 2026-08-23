@@ -115,7 +115,7 @@ Researched August 2026. Facts verified against each project's repository; capabi
 | **Credentials centralised** | ✅ Worker Secrets | On the site itself | Per client | Hosted tier | ❌ per laptop | ✅ vendor-hosted |
 | **Multi-site, one server** | ✅ | ❌ one plugin per site | ❌ | Partial | ✅ | ✅ |
 | **Requires a plugin** | Optional | **Required** | Required | Optional | ❌ | Required |
-| **Works on WP < 6.9** | ✅ | ❌ needs Abilities API | ✅ | ✅ | ✅ | ✅ |
+| **Minimum WordPress** | 6.0 | Needs the Abilities API (core in 7.0+) | 6.4 | 6.0 | 6.0 | — |
 | **Partial/targeted edits** | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | **Theme file editing** | ✅ sandboxed drafts | ❌ | ❌ | ✅ | ❌ | ✅ |
 | **WP-CLI** | ✅ 50+, emulated | ❌ | ❌ | ✅ | ❌ | ✅ |
@@ -127,9 +127,9 @@ Researched August 2026. Facts verified against each project's repository; capabi
 
 ### What this means in practice
 
-**[WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter) is the official direction, and wpxmcp is complementary rather than competing.** It bridges the [Abilities API](https://github.com/WordPress/abilities-api) to MCP, turning a site into an MCP server at `/wp-json/mcp/mcp-adapter-default-server`. It is excellent for *plugin-defined* capabilities — but it can only expose abilities that something registered, abilities are private unless explicitly published, and the Abilities API ships as a feature plugin proposed for core rather than something already on every site. It is also one endpoint per site, so multi-site management means multiple connections.
+**[WordPress MCP Adapter](https://github.com/WordPress/mcp-adapter) is the official direction, and wpxmcp is complementary rather than competing.** It bridges the [Abilities API](https://github.com/WordPress/abilities-api) to MCP, turning a site into an MCP server at `/wp-json/mcp/mcp-adapter-default-server`. It is excellent for *plugin-defined* capabilities — but it can only expose abilities that something registered, and abilities are private unless explicitly published. Core itself registers just three, all read-only. It is also one endpoint per site, so managing several sites means several connections and several plugin installs.
 
-wpxmcp works against **any WordPress 6.0+ site today**, manages many sites through one connection, and **acts as an Abilities API client** — `discover_abilities` and `run_ability` call `/wp-abilities/v1/…` directly. Where a plugin exposes an ability, using it is the *right* answer, because the plugin's own validation, hooks and cache invalidation run. wpxmcp prefers abilities and falls back to REST, WP-CLI, then guarded SQL, in that order.
+wpxmcp works against **any WordPress 6.0+ site today**, manages many sites through one connection, and **acts as an Abilities API client** — `discover_abilities` and `run_ability` call `/wp-abilities/v1/…` directly, which is in core from WordPress 7.0 and needs no adapter. Where a plugin exposes an ability, using it is the *right* answer, because the plugin's own validation, hooks and cache invalidation run. wpxmcp prefers abilities and falls back to REST, WP-CLI, then guarded SQL, in that order.
 
 **[Automattic's wordpress-mcp](https://github.com/Automattic/wordpress-mcp) is archived** (944 stars, last pushed August 2025). Its own repository description directs you to the MCP Adapter. Several "best WordPress MCP servers" lists still recommend it; they are out of date.
 
@@ -156,9 +156,15 @@ The remaining 24 exist because **WordPress itself provides no API for them** —
 | Meta without `show_in_rest` | Core **silently discards** it. This is most page-builder and ACF data. | `register_post_meta` semantics |
 | Options, theme mods, Site Health | Not exposed over REST. | REST API Handbook |
 
-**Could the Abilities API replace it?** Not today. The [Abilities API](https://github.com/WordPress/abilities-api) ships [exactly three core abilities](https://github.com/WordPress/abilities-api/blob/trunk/includes/abilities/wp-core-abilities.php) — `core/get-site-info`, `core/get-user-info` and `core/get-environment-info` — all read-only, and none covering WP-CLI, SQL, theme files or arbitrary meta. It is also still a feature plugin proposed for core, so it is not yet on the sites you already manage.
+**Could the Abilities API replace it?** No — and this is checked against a live install, not the documentation. The Abilities API **is now in WordPress core** (verified on 7.1: `wp-includes/abilities-api/`, serving `wp-abilities/v1`). But core registers **exactly three abilities**, all read-only: `core/get-site-info`, `core/get-user-info` and `core/get-environment-info`. None touches WP-CLI, SQL, theme files or arbitrary meta. It is an excellent way to reach *plugin-registered* capabilities — which is why wpxmcp is a client of it — and no substitute for the routes core simply does not have.
 
 **Every WordPress MCP tool that offers these capabilities ships site-side code**, including the official [MCP Adapter](https://github.com/WordPress/mcp-adapter), which is itself a plugin and is *mandatory* rather than optional. This is a platform boundary, not a differentiator.
+
+### Do you need WordPress/mcp-adapter installed?
+
+**No.** It is an alternative to wpxmcp, not a dependency of it. The adapter turns a WordPress site *into* an MCP server that clients connect to directly; wpxmcp *is* the MCP server and reaches WordPress over its REST API. You would install the adapter if you preferred that architecture — you never need it to run wpxmcp.
+
+The one place they meet is the Abilities API, which wpxmcp calls directly at `wp-abilities/v1` and which is **built into WordPress core**, not provided by the adapter. `discover_abilities`, `get_ability_info` and `run_ability` work on a stock WordPress 7.x with nothing installed; on older versions they report that the API is absent and suggest alternatives. Installing the adapter alongside wpxmcp changes nothing about how wpxmcp behaves.
 
 ### Where wpxmcp differs: the plugin is optional and additive
 
@@ -368,7 +374,13 @@ Adding a tool is one `defineTool({...})`. It appears on both transports automati
 
 **v1.0.0.** 48 tests, CI across Node 20/22/24 and PHP 7.4/8.3, both entry points built and the Worker deploy dry-run verified on every push.
 
-Honest about what has and has not been exercised: the TypeScript server, both transports and all guardrails are tested and were run end to end. The companion plugin lints clean on PHP 8.5 and follows WordPress APIs throughout, but has not yet been run against a live WordPress install — if you try it, [an issue](https://github.com/wpxmcp/wpxmcp/issues) with what you find is the single most useful contribution right now.
+**Verified against a live WordPress 7.1 install**, not only unit-tested. Every tool was exercised against a real site: 47 of 49 non-plugin tools succeeded (the two failures were a sandbox blocking `api.wordpress.org`, not code), and after installing the companion plugin the remaining 24 worked too — WP-CLI emulation, guarded SQL, the theme draft/preview/publish cycle, editable fields and snippets.
+
+Every guardrail was confirmed to actually hold: writes to a live theme refused, four path-traversal attempts refused, the extension allowlist refused `.sh`, protected options refused via both `set_option` and WP-CLI, `db drop` and shell metacharacters refused by the allowlist, stacked SQL refused, mutating SQL previewed rather than run, and the tokenised preview URL rendering the draft while the public URL kept serving the live theme.
+
+That exercise found and fixed five real bugs, including ability routes that matched the published documentation but not core's actual registration.
+
+Welcome next: more playbooks (WooCommerce, ACF, multisite), page-builder write paths that go through each builder's own save routine, and additional WP-CLI commands for the allowlist.
 
 Also welcome: more playbooks (WooCommerce, ACF, multisite), page-builder write paths that go through each builder's own save routine, and additional WP-CLI commands for the allowlist.
 

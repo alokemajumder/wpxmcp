@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [1.0.0] — 2026-08-23
 
-First release.
+First release. Verified end to end against a live WordPress 7.1 install.
 
 ### Added
 

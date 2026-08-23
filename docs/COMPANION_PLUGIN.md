@@ -24,7 +24,7 @@ cd wp-plugin && zip -r wpxmcp-helper.zip wpxmcp-helper
 
 | Endpoint | Tools it powers |
 | --- | --- |
-| `/site-info` | `site_info` — PHP, database size, Site Health, pending updates |
+| `/site-info` | `site_info` — PHP version, database and table sizes, Site Health *direct* tests, pending updates. Core exposes only the async tests at `wp-site-health/v1` (loopback, HTTPS, background updates, the Authorization header), which wpxmcp uses without the plugin. |
 | `/cli` | `run_wp_cli` — 50+ emulated commands |
 | `/sql` | `execute_sql_query` |
 | `/meta` | `get_content_meta`, `set_content_meta` |

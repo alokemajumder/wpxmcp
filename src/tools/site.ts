@@ -312,7 +312,7 @@ export function siteConfigTools(ctx: ToolContext) {
         const ns = client.site.helperNamespace ?? "wpxmcp/v1";
         if (await client.hasHelperPlugin()) {
           const res = await client.get<any>(`/${ns}/meta`, { post_id: id, keys: keys?.join(","), include_protected: include_protected ? 1 : 0 });
-          return ok({ content_id: id, source: "companion plugin (all keys)", meta: res.data });
+          return ok({ content_id: id, source: "companion plugin (all keys)", ...res.data });
         }
         const types = await client.postTypes();
         for (const t of Object.values<any>(types)) {

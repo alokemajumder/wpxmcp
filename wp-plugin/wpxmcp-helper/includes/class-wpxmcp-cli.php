@@ -127,6 +127,17 @@ class WPXMCP_CLI {
 		}
 
 		if ( is_wp_error( $result ) ) {
+			// Commands raise WP_Error without a status; a refusal or bad argument is
+			// a client error, not a server fault. Preserve any status already set.
+			$data = $result->get_error_data();
+			if ( ! is_array( $data ) || ! isset( $data['status'] ) ) {
+				$client_errors = array( 'wpxmcp_protected_option', 'wpxmcp_missing_arg', 'wpxmcp_not_found', 'wpxmcp_plugin_active', 'wpxmcp_empty_search' );
+				$status        = in_array( $result->get_error_code(), $client_errors, true ) ? 400 : 500;
+				if ( 'wpxmcp_protected_option' === $result->get_error_code() ) {
+					$status = 403;
+				}
+				$result->add_data( array( 'status' => $status ), $result->get_error_code() );
+			}
 			return $result;
 		}
 
