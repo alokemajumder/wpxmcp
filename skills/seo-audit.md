@@ -2,7 +2,7 @@
 name: seo-audit
 title: Auditing and fixing SEO
 description: How to detect the active SEO plugin, find missing metadata and alt text, and fix it in bulk.
-keywords: seo, yoast, rank math, aioseo, seopress, meta description, alt text, audit, title tag, schema, sitemap
+keywords: seo, yoast, rank math, aioseo, seopress, meta description, alt text, audit, title tag, schema, sitemap, rank, ranking, google, search engine, traffic, visibility, found on google, seo score
 ---
 
 ## 1. Detect the plugin first

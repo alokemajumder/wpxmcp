@@ -2,7 +2,7 @@
 name: design
 title: Designing a site that looks considered
 description: Aesthetic guidance for producing distinctive, polished WordPress themes rather than generic ones.
-keywords: design, aesthetic, style, colors, typography, layout, spacing, polish, ui, look
+keywords: design, aesthetic, style, colors, typography, layout, spacing, polish, ui, look, polished, beautiful, modern, branding, font, colour
 ---
 
 ## Decide the character first

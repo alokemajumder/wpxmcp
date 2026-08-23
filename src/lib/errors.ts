@@ -12,6 +12,9 @@ export class WPError extends Error {
     this.name = "WPError";
   }
 
+  /** Retry-After header from the response, when the server sent one. */
+  public retryAfter: string | null = null;
+
   toReport(): string {
     const lines = [
       `WordPress request failed: ${this.method} ${this.url}`,

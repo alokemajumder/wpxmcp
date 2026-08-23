@@ -52,27 +52,75 @@ export function readSkill(name: string): Skill | null {
   return listSkills().find((s) => s.name === name) ?? null;
 }
 
-/** Ranks skills against a free-text task description. */
+/** Words too common to signal anything on their own. */
+const STOPWORDS = new Set([
+  "the", "a", "an", "my", "our", "your", "this", "that", "these", "those",
+  "and", "or", "but", "for", "with", "from", "into", "onto", "about",
+  "how", "what", "why", "when", "where", "which", "who",
+  "can", "should", "would", "could", "will", "want", "need", "help", "please",
+  "some", "any", "all", "more", "most", "new", "old",
+  "site", "website", "wordpress", "wp", "make", "get", "set", "put", "use",
+]);
+
+function tokenize(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2 && !STOPWORDS.has(t));
+}
+
+/**
+ * Ranks skills against a free-text task description.
+ *
+ * Weighted so that a deliberate multi-word keyword ("page builder", "meta
+ * description") outranks an incidental single word. Matching is on whole words:
+ * substring matching made "clear the spam comments" score against a skill whose
+ * text merely contained those letters somewhere.
+ */
 export function matchSkills(query: string): Array<Skill & { score: number }> {
   const q = query.toLowerCase();
-  const terms = q.split(/[^a-z0-9]+/).filter((t) => t.length > 2);
+  const terms = tokenize(query);
+  const termSet = new Set(terms);
+
+  // Whole-word, but tolerant of the plural a person naturally types:
+  // "photos" should match the keyword "photo", and "categories" "category".
+  const hasWord = (haystack: string, word: string) => {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const stem = escaped.replace(/(?:ies|es|s)$/i, "");
+    return new RegExp(`\\b(?:${escaped}|${stem}(?:s|es|ies)?)\\b`, "i").test(haystack);
+  };
 
   return listSkills()
     .map((skill) => {
       let score = 0;
-      const haystack = `${skill.name} ${skill.title} ${skill.description} ${skill.keywords.join(" ")}`.toLowerCase();
-      for (const keyword of skill.keywords) {
-        if (q.includes(keyword.toLowerCase())) score += 10;
+      const title = skill.title.toLowerCase();
+      const description = skill.description.toLowerCase();
+
+      for (const raw of skill.keywords) {
+        const keyword = raw.toLowerCase().trim();
+        if (!keyword) continue;
+        if (keyword.includes(" ")) {
+          // A multi-word keyword is a deliberate signal; require the whole phrase.
+          if (q.includes(keyword)) score += 14;
+        } else if (!STOPWORDS.has(keyword) && hasWord(q, keyword)) {
+          score += 6;
+        }
       }
-      if (q.includes(skill.name.replace(/-/g, " "))) score += 12;
+
+      // The skill's own name, spoken aloud.
+      if (q.includes(skill.name.replace(/-/g, " "))) score += 16;
+      for (const part of skill.name.split("-")) {
+        if (part.length > 3 && termSet.has(part)) score += 3;
+      }
+
+      // Weaker corroborating signal from the title and description.
       for (const term of terms) {
-        if (haystack.includes(term)) score += 2;
+        if (hasWord(title, term)) score += 3;
+        else if (hasWord(description, term)) score += 1;
       }
-      if (skill.source === "saved") score += 3; // the user's own conventions win ties
+
+      if (skill.source === "saved") score += 4; // the user's own conventions win ties
       return { ...skill, score };
     })
     .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
 }
 
 export function canSaveSkills(): boolean {

@@ -2,7 +2,7 @@
 name: page-builders
 title: Working with page builders
 description: How to edit Elementor, Divi, Beaver Builder, Bricks, Breakdance and SeedProd content without corrupting the layout.
-keywords: elementor, divi, beaver builder, bricks, breakdance, seedprod, kadence, page builder, wpbakery, oxygen, layout
+keywords: elementor, divi, beaver builder, bricks, breakdance, seedprod, kadence, page builder, wpbakery, oxygen, layout, theme builder, builder template, landing page
 ---
 
 ## Read this before touching builder content

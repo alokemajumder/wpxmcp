@@ -32,6 +32,39 @@ function encodeBase64(input: string): string {
   return btoa(binary);
 }
 
+/** Transient statuses worth retrying. 500 is excluded: it is usually a real PHP fatal. */
+const RETRYABLE_STATUS = new Set([408, 429, 502, 503, 504]);
+
+/** Connection-level failures that are worth another attempt. */
+const RETRYABLE_NETWORK = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN",
+  "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET",
+]);
+
+const MAX_ATTEMPTS = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * How long to wait before the next attempt.
+ *
+ * Honours Retry-After when the server sends one — a rate limiter knows better
+ * than we do — otherwise exponential backoff with jitter so a fleet of clients
+ * does not retry in lockstep.
+ */
+function backoffMs(attempt: number, retryAfter: string | null): number {
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000);
+    const at = Date.parse(retryAfter);
+    if (!Number.isNaN(at)) return Math.min(Math.max(at - Date.now(), 0), 10_000);
+  }
+  const base = 300 * 2 ** (attempt - 1);
+  return Math.min(base, 4000) + Math.floor(Math.random() * 200);
+}
+
 export class WordPressClient {
   private insecureAgent?: unknown;
   private typeCache?: { at: number; data: any };
@@ -120,8 +153,44 @@ export class WordPressClient {
     }
   }
 
+  /**
+   * Performs a request, retrying transient failures.
+   *
+   * Only reads are retried. Replaying a POST could create a second post or run
+   * a mutation twice, and no amount of backoff makes that acceptable — a failed
+   * write is reported so the caller can decide.
+   */
   async request<T = any>(route: string, options: RequestOptions = {}): Promise<WPResponse<T>> {
     const method = options.method ?? "GET";
+    const idempotent = method === "GET";
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= (idempotent ? MAX_ATTEMPTS : 1); attempt++) {
+      try {
+        return await this.attempt<T>(route, options, method);
+      } catch (error) {
+        lastError = error;
+        if (attempt === MAX_ATTEMPTS || !idempotent) break;
+
+        // Timeouts are deliberately not retried. A timeout means the server
+        // accepted the connection and is simply slow, so another attempt rarely
+        // helps and multiplies the wait — three 60s attempts would exceed the
+        // Worker's own request budget. Connection-level failures are different:
+        // those are worth one more try.
+        const retryable =
+          error instanceof WPError &&
+          (RETRYABLE_STATUS.has(error.status) ||
+            (error.status === 0 && error.code !== "timeout" && RETRYABLE_NETWORK.has(String(error.code))));
+        if (!retryable) break;
+
+        const wait = backoffMs(attempt, (error as WPError).retryAfter ?? null);
+        await sleep(wait);
+      }
+    }
+    throw lastError;
+  }
+
+  private async attempt<T = any>(route: string, options: RequestOptions, method: NonNullable<RequestOptions["method"]>): Promise<WPResponse<T>> {
     const url = this.buildUrl(route, options.query);
     const headers: Record<string, string> = {
       Accept: "application/json",
@@ -199,7 +268,21 @@ export class WordPressClient {
       if (typeof data === "string" && /<html/i.test(data)) {
         hint = "The site returned HTML rather than JSON — usually a security plugin, a WAF challenge page, or a wrong REST prefix.";
       }
-      throw new WPError(stripTags(String(message)), res.status, code, url, method, data, hint);
+      const failure = new WPError(stripTags(String(message)), res.status, code, url, method, data, hint);
+      failure.retryAfter = res.headers.get("retry-after");
+      throw failure;
+    }
+
+    // Every REST route returns JSON. An HTML body on a 2xx means something in
+    // front of WordPress answered instead — a WAF challenge, a caching layer, or
+    // a login wall. Content-Type is deliberately not consulted: those pages
+    // legitimately declare text/html, which is exactly the case to catch.
+    if (typeof data === "string" && /^\s*<(!doctype|html)\b/i.test(data.trimStart())) {
+      throw new WPError(
+        "The site returned HTML where JSON was expected.",
+        res.status, "html_response", url, method, data.slice(0, 400),
+        "This is almost always a security plugin or WAF serving a challenge page, or a caching layer returning the wrong document. Allowlist this client, or check the REST prefix."
+      );
     }
 
     const total = res.headers.get("x-wp-total");

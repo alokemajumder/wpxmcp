@@ -2,7 +2,7 @@
 name: troubleshooting
 title: Diagnosing WordPress problems
 description: A systematic approach to REST failures, changes that do not appear, and broken sites.
-keywords: error, debug, broken, not working, 500, white screen, fatal, cache, troubleshoot, fix, failing
+keywords: error, debug, broken, not working, 500, white screen, fatal, cache, troubleshoot, fix, failing, down, slow, wrong, not showing
 ---
 
 ## Start here

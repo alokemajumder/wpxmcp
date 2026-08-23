@@ -301,6 +301,34 @@ class WPXMCP_Fields {
 	}
 
 	/**
+	 * A default value whose PHP type matches the registered REST type.
+	 *
+	 * register_meta() and register_setting() emit a _doing_it_wrong() notice when
+	 * the default does not match the declared type — an image field declares
+	 * `integer` but carries '' unless the author set one, which fired on every
+	 * request. Coercing here keeps the registration valid whatever the author
+	 * supplied.
+	 *
+	 * @param array $field Field definition.
+	 * @return mixed
+	 */
+	private function default_for( $field ) {
+		$declared = $this->rest_type( $field );
+		$default  = $field['default'] ?? '';
+
+		switch ( $declared ) {
+			case 'array':
+				return is_array( $default ) ? $default : array();
+			case 'integer':
+				return is_numeric( $default ) ? (int) $default : 0;
+			case 'number':
+				return is_numeric( $default ) ? (float) $default : 0;
+			default:
+				return is_scalar( $default ) ? (string) $default : '';
+		}
+	}
+
+	/**
 	 * Register every field with WordPress so REST can read and write it.
 	 */
 	public function register_meta() {
@@ -312,7 +340,7 @@ class WPXMCP_Fields {
 							'type'         => $this->rest_type( $field ),
 							'description'  => $field['description'],
 							'single'       => true,
-							'default'      => in_array( $field['type'], array( 'gallery', 'repeater' ), true ) ? array() : $field['default'],
+							'default'      => $this->default_for( $field ),
 							'show_in_rest' => in_array( $field['type'], array( 'gallery', 'repeater' ), true )
 								? array( 'schema' => array( 'type' => 'array', 'items' => array( 'type' => 'gallery' === $field['type'] ? 'integer' : 'object' ) ) )
 								: true,
@@ -329,7 +357,7 @@ class WPXMCP_Fields {
 				register_setting( 'wpxmcp_fields', $field['key'], array(
 					'type'         => $this->rest_type( $field ),
 					'description'  => $field['description'],
-					'default'      => $field['default'],
+					'default'      => $this->default_for( $field ),
 					'show_in_rest' => in_array( $field['type'], array( 'gallery', 'repeater' ), true )
 						? array( 'schema' => array( 'type' => 'array', 'items' => array( 'type' => 'gallery' === $field['type'] ? 'integer' : 'object' ) ) )
 						: true,

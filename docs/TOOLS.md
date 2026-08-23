@@ -19,7 +19,9 @@ Load these before doing substantive work — they encode what the API alone does
 | `save_skill` | Save your own conventions so future sessions follow them |
 | `delete_skill` | Remove a saved playbook |
 
-Bundled playbooks: `site-setup`, `gutenberg`, `classic-theme`, `page-builders`, `seo-audit`, `editable-fields`, `design`, `troubleshooting`.
+Bundled playbooks: `everyday-tasks`, `site-setup`, `gutenberg`, `classic-theme`, `page-builders`, `seo-audit`, `editable-fields`, `design`, `troubleshooting`.
+
+`everyday-tasks` is the one to reach for when a site owner describes an outcome rather than a mechanism — "put the new prices up", "clear the spam", "update my plugins". It covers confirming what they meant, drafting before publishing, and what to say before an irreversible step.
 
 ---
 

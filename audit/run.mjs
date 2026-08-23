@@ -253,7 +253,7 @@ await expectRefused("bulk_update_content", { type: "post", limit: 5 }, /Nothing 
 
 /* ────────────────────────── SKILLS ────────────────────────── */
 section("skills");
-await expectOk("list_skills", {}, (d) => d.count === 8 ? null : `expected 8 skills, got ${d.count}`);
+await expectOk("list_skills", {}, (d) => d.count >= 9 ? null : `expected at least 9 playbooks, got ${d.count}`);
 await expectOk("load_skill", { query: "elementor page builder" }, (_, t) => /page builder/i.test(t) ? null : "wrong skill matched");
 await expectOk("load_skill", { name: "gutenberg" });
 await expectOk("load_skill", { query: "zzz nothing matches this at all" });

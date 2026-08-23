@@ -2,7 +2,7 @@
 name: classic-theme
 title: Building classic PHP themes
 description: How to author classic PHP theme templates with Tailwind, using the draft workflow so the live site is never broken.
-keywords: theme, classic theme, php, template, tailwind, header, footer, functions.php, theme builder, design, style
+keywords: theme, classic theme, php, template, tailwind, header, footer, functions.php, design, style, php template, template hierarchy
 ---
 
 ## Why classic templates

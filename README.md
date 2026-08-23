@@ -44,6 +44,8 @@ The page cache was stale, not the write — found because the tool read the *ren
 
 **Everything REST can't reach.** WP-CLI, SQL, theme files and unregistered meta have no core REST route. An optional companion plugin adds exactly those.
 
+**Usable by the site's owner, not just a developer.** Ask for an outcome — *"put the new prices up"*, *"clear the spam"* — and the agent loads a playbook that tells it to confirm which page it found, read the current wording back, draft before publishing, and say plainly when a step cannot be undone.
+
 ---
 
 ## Deploy remotely (recommended)
@@ -125,7 +127,7 @@ Every WordPress MCP tool offering these ships site-side code, the official [MCP 
 | **Power** (12) | WP-CLI, guarded SQL, Abilities API, snippets, editable fields |
 | **Bulk & audit** (3) | Dry-run bulk edits, content and media audits |
 | **Multi-site** (4) | One server, many sites; every tool takes `site_id` |
-| **Playbooks** (4) | Eight built-in skills the agent loads before it works |
+| **Playbooks** (4) | Nine built-in skills the agent loads before it works |
 
 **[Full tool reference →](docs/TOOLS.md)**
 
@@ -162,7 +164,7 @@ Welcome next: more playbooks (WooCommerce, ACF, multisite), page-builder write p
 
 ```bash
 npm install && npm run build
-npm test            # 56 tests, no network needed
+npm test            # 68 tests, no network needed
 npm run cf:dev      # the worker locally at :8787/mcp
 ```
 
