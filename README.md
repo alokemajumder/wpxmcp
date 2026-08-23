@@ -2,8 +2,8 @@
 
 **A remote-first MCP server for self-hosted WordPress.** Manage content, design, themes, plugins, menus, widgets, users and the database from any MCP client — with your WordPress credentials in Cloudflare Worker Secrets instead of on every laptop.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wpxmcp/wpxmcp)
-[![CI](https://github.com/wpxmcp/wpxmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/wpxmcp/wpxmcp/actions/workflows/ci.yml)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/alokemajumder/wpxmcp)
+[![CI](https://github.com/alokemajumder/wpxmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alokemajumder/wpxmcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-black.svg)](https://modelcontextprotocol.io)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -194,7 +194,7 @@ The plugin adds REST routes under `wpxmcp/v1`, every one of them requiring an au
 
 ### One click
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wpxmcp/wpxmcp)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/alokemajumder/wpxmcp)
 
 Cloudflare forks the repository to your account, provisions the Worker, sets up CI/CD, and **prompts you for the two secrets** (`WPX_AUTH_TOKEN` and `WPX_SITES`) as part of the flow.
 
@@ -230,7 +230,7 @@ Free tier covers 100,000 requests a day, and a stateless server holds nothing op
 ## Or run it locally over stdio
 
 ```bash
-git clone https://github.com/wpxmcp/wpxmcp.git
+git clone https://github.com/alokemajumder/wpxmcp.git
 cd wpxmcp && npm install && npm run build
 ```
 

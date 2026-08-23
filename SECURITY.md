@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report privately through [GitHub Security Advisories](https://github.com/wpxmcp/wpxmcp/security/advisories/new). Please do not open a public issue for a security problem.
+Report privately through [GitHub Security Advisories](https://github.com/alokemajumder/wpxmcp/security/advisories/new). Please do not open a public issue for a security problem.
 
 Include what you did, what happened, and what you expected. You will get an acknowledgement within 72 hours and an assessment within a week.
 

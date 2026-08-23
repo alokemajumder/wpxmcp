@@ -12,7 +12,7 @@ MCP client  ──HTTPS + Bearer──▶  Cloudflare Worker  ──Application 
 
 ## 1. One-click deploy
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wpxmcp/wpxmcp)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/alokemajumder/wpxmcp)
 
 The button clones this repository into your own GitHub or GitLab account, creates the Worker, and configures Workers Builds so every push to your production branch redeploys.
 
@@ -40,7 +40,7 @@ Requirements for the button to work at all, which this repository already satisf
 ## 2. Manual deploy
 
 ```bash
-git clone https://github.com/wpxmcp/wpxmcp.git
+git clone https://github.com/alokemajumder/wpxmcp.git
 cd wpxmcp
 npm install
 npx wrangler login

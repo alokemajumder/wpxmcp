@@ -51,12 +51,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wpxmcp/wpxmcp.git"
+    "url": "git+https://github.com/alokemajumder/wpxmcp.git"
   },
   "bugs": {
-    "url": "https://github.com/wpxmcp/wpxmcp/issues"
+    "url": "https://github.com/alokemajumder/wpxmcp/issues"
   },
-  "homepage": "https://github.com/wpxmcp/wpxmcp#readme",
+  "homepage": "https://github.com/alokemajumder/wpxmcp#readme",
   "cloudflare": {
     "label": "wpxmcp \u2014 WordPress MCP server",
     "products": [
@@ -65,7 +65,7 @@
     "categories": [
       "ai"
     ],
-    "docs_url": "https://github.com/wpxmcp/wpxmcp/blob/main/docs/DEPLOY_CLOUDFLARE.md",
+    "docs_url": "https://github.com/alokemajumder/wpxmcp/blob/main/docs/DEPLOY_CLOUDFLARE.md",
     "preview_image_url": "",
     "publish": true,
     "bindings": {
