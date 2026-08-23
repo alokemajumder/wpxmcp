@@ -1,0 +1,9 @@
+# Default owner for everything in this repository.
+*                       @alokemajumder
+
+# Security-sensitive areas: the guards, the auth path, and the site-side code
+# that runs inside someone's WordPress. Changes here deserve a closer look.
+/src/lib/safety.ts      @alokemajumder
+/src/worker.ts          @alokemajumder
+/wp-plugin/             @alokemajumder
+/SECURITY.md            @alokemajumder
