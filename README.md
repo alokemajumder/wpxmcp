@@ -1,13 +1,62 @@
 # wpxmcp
 
-**A remote-first MCP server for self-hosted WordPress.** Manage content, design, themes, plugins, menus, widgets, users and the database from any MCP client — with WordPress credentials held in Cloudflare Worker Secrets rather than on every laptop.
+**A remote-first MCP server for self-hosted WordPress.** Manage content, design, themes, plugins, menus, widgets, users and the database from any MCP client — with your WordPress credentials in Cloudflare Worker Secrets instead of on every laptop.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wpxmcp/wpxmcp)
 [![CI](https://github.com/wpxmcp/wpxmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/wpxmcp/wpxmcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-black.svg)](https://modelcontextprotocol.io)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+**117 tools · 2 transports · 0 required plugins · MIT**
 
 > Self-hosted WordPress only. WordPress.com does not expose the REST endpoints or filesystem this depends on.
+
+---
+
+## What it feels like to use
+
+> **"Find the pricing page, change the Pro tier to $49, and check it actually shows."**
+
+```
+find_content_by_url  https://example.com/pricing/
+  → resolved by "slug lookup in \"page\"" — id 812, type page, 1,240 words
+
+update_content  id 812, edits: [{ find: "<strong>$39</strong>", replace: "<strong>$49</strong>" }]
+  → updated. 1 replacement. Body length 8,431 → 8,431 characters.
+
+get_page_html  /pricing/  mode: "summary"
+  → title "Pricing — Example", h1_count 1, images_missing_alt 0
+  → still shows $39
+```
+
+The page cache is stale, not the write. One `run_wp_cli cache flush` later it is correct — and you found that out because the tool read the *rendered page*, not because the API said `200`.
+
+> **"Audit the blog for SEO problems."**
+
+```
+audit_content  type: "post", limit: 200
+  → examined 200, items_with_issues 47, clean_items 153
+  → issue_summary:
+       "no SEO meta description"                          31
+       "no featured image"                                22
+       "N of N inline images have no alt text"            18
+       "thin content (N words, threshold N)"               9
+       "title is N characters — search results usually…"   6
+  → findings: [{ id, title, link, word_count, issues: [...] }, ...]
+```
+
+Then fix them in bulk — and see exactly what would change before anything is written:
+
+```
+bulk_update_content  type: "post", filter: { categories: [12] }, changes: { status: "draft" }
+  → applied: false, dry_run: true
+  → would_update 14, would_skip 3
+  → plan: [{ id: 902, title: "…", current_status: "publish", would_change: ["status"] }, …]
+  → confirm_token: "confirm-3f9a1c4b7e02d85c61"
+```
+
+Nothing was written. Re-run with that token and it applies — change any argument and the token stops matching.
 
 ---
 
@@ -92,29 +141,46 @@ wpxmcp works against **any WordPress 6.0+ site today**, manages many sites throu
 
 ---
 
-## Do you need the WordPress plugin?
+## Is it a remote MCP server, or a plugin?
 
-**Usually not.** wpxmcp is a remote MCP server that talks to WordPress over its REST API. Nothing needs to be installed on the site for the great majority of it.
+**It is a remote MCP server.** wpxmcp runs on Cloudflare Workers (or locally over stdio) and talks to WordPress over its public REST API. Your sites need nothing installed for **93 of the 117 tools**.
 
-**Works with no plugin — 93 of 117 tools:** posts, pages, every custom post type, categories, tags, custom taxonomies, media and uploads, users, comments, plugin install/activate/delete, themes list/activate, menus and menu items, widgets and sidebars, block templates, global styles, reusable blocks, site settings, revisions, rendered page HTML, search, and the raw `rest_api` escape hatch.
+The remaining 24 exist because **WordPress itself provides no API for them** — not because of a design shortcut here. That claim is worth checking rather than taking on trust, so here is the evidence:
 
-**Needs the [companion plugin](wp-plugin/wpxmcp-helper) — 24 tools**, because core WordPress registers **no REST route** for them at all:
+| Capability | What core WordPress offers | Verified against |
+| --- | --- | --- |
+| Activate / install a theme | `/wp/v2/themes` is **GET-only**. Every schema field is read-only; there is no POST, PUT or DELETE route. | [REST API Handbook: Themes](https://developer.wordpress.org/rest-api/reference/themes/) |
+| Read / write theme files | No route at all. The theme file editor is an admin screen, never an API. | REST API Handbook |
+| Run WP-CLI | No route. WP-CLI is a separate binary that expects shell access. | — |
+| Run SQL | No route, by design. | — |
+| Meta without `show_in_rest` | Core **silently discards** it. This is most page-builder and ACF data. | `register_post_meta` semantics |
+| Options, theme mods, Site Health | Not exposed over REST. | REST API Handbook |
 
-| Capability | Why REST cannot do it |
+**Could the Abilities API replace it?** Not today. The [Abilities API](https://github.com/WordPress/abilities-api) ships [exactly three core abilities](https://github.com/WordPress/abilities-api/blob/trunk/includes/abilities/wp-core-abilities.php) — `core/get-site-info`, `core/get-user-info` and `core/get-environment-info` — all read-only, and none covering WP-CLI, SQL, theme files or arbitrary meta. It is also still a feature plugin proposed for core, so it is not yet on the sites you already manage.
+
+**Every WordPress MCP tool that offers these capabilities ships site-side code**, including the official [MCP Adapter](https://github.com/WordPress/mcp-adapter), which is itself a plugin and is *mandatory* rather than optional. This is a platform boundary, not a differentiator.
+
+### Where wpxmcp differs: the plugin is optional and additive
+
+Install it only if you want what is in that table. Nothing degrades if you do not, and every tool that needs it says so by name and tells you how to install it — rather than failing with a confusing 404.
+
+**Works against a stock WordPress install, nothing added (93 tools):**
+posts · pages · every custom post type · categories · tags · custom taxonomies · media and uploads · users · comments · plugin install/activate/delete · theme listing · menus and menu items · widgets and sidebars · block templates · global styles · reusable blocks · site settings · revisions · rendered page HTML · search · the raw `rest_api` escape hatch · the Abilities API client
+
+**Needs the [companion plugin](wp-plugin/wpxmcp-helper) (24 tools):**
+WP-CLI · SQL · theme files and the draft/preview/publish workflow · theme activation and installation · unregistered post meta · options · theme mods · Site Health and database size · code snippets · editable fields
+
+Four further tools (`site_info`, `get_content_meta`, `list_roles`, `discover_abilities`) work either way and simply return more when the plugin is present, saying which parts they could not see.
+
+### Which to run
+
+| You want | Run |
 | --- | --- |
-| WP-CLI commands | No REST equivalent exists |
-| SQL queries | No REST equivalent exists |
-| Theme file read/write, drafts, preview, publish | The theme editor is an admin-only screen, not an API |
-| Meta keys without `show_in_rest` | Core REST silently discards them — this is most page-builder and ACF data |
-| Options and theme mods | Not exposed |
-| Site Health, PHP version, database size | Not exposed |
-| Code snippets and editable fields | Features this plugin provides |
+| Content, media, taxonomies, users, comments, menus, widgets — the everyday work | **The MCP server alone.** Nothing on the site. |
+| Theme building, WP-CLI, SQL, page-builder meta, editable fields | **MCP server + companion plugin.** |
+| Only plugin-registered abilities on WordPress 6.9+ | Consider the official [MCP Adapter](https://github.com/WordPress/mcp-adapter) instead — and note wpxmcp can call those abilities too. |
 
-Four of the 93 (`site_info`, `get_content_meta`, `list_roles`, `discover_abilities`) work without the plugin but return more when it is present, and say which parts they could not see.
-
-This is a genuine platform limitation, not a design choice — every WordPress MCP server that offers WP-CLI or theme editing ships site-side code, and the official MCP Adapter is itself a plugin. wpxmcp differs in making it **optional**: install it only if you need what is in that table, and every tool that requires it says so and tells you how to install it.
-
-The plugin adds REST routes under `wpxmcp/v1`, all requiring an authenticated administrator. See [docs/COMPANION_PLUGIN.md](docs/COMPANION_PLUGIN.md).
+The plugin adds REST routes under `wpxmcp/v1`, every one of them requiring an authenticated administrator. Full detail: [docs/COMPANION_PLUGIN.md](docs/COMPANION_PLUGIN.md).
 
 ---
 
@@ -257,6 +323,57 @@ That JSON is the `WPX_SITES` secret remotely, or `~/.wpxmcp/sites.json` locally.
 
 ---
 
+## Architecture
+
+```
+                       ┌─────────────────────────────────────────┐
+   MCP client          │  Cloudflare Worker (your account)       │
+   Claude / Cursor ───►│                                         │
+   ChatGPT / …         │  Authorization: Bearer <WPX_AUTH_TOKEN> │
+        │              │                                         │
+        │              │  Worker Secrets ── WPX_SITES            │
+   one bearer token    │    (WordPress Application Passwords)    │
+   per person          └──────────────────┬──────────────────────┘
+                                          │  Basic auth over HTTPS
+                          ┌───────────────┼───────────────┐
+                          ▼               ▼               ▼
+                    blog.example    shop.example    example.com
+                       WP REST         WP REST         WP REST
+                          └── + optional wpxmcp-helper plugin ──┘
+                              (WP-CLI, SQL, theme files, meta)
+```
+
+**Stateless.** Each request builds a fresh server and tears it down — no Durable Object, no session affinity, no connection held open. That is why it fits in Cloudflare's free tier and why an isolate can be evicted between calls without anything breaking.
+
+**One toolset, two transports.** `src/index.ts` (stdio) and `src/worker.ts` (HTTP) both build from `src/toolset.ts`, so the two deployments cannot drift apart. A `platform()` abstraction keeps `src/lib` and `src/tools` free of Node APIs; CI fails if `node:fs`, `process` or `Buffer` appear there.
+
+---
+
+## Why you might fork this
+
+It is MIT, and the parts worth stealing are separable:
+
+- **`src/lib/http-transport.ts`** — a stateless MCP Streamable HTTP transport in ~180 lines, no Durable Objects and no Cloudflare-specific SDK. Drop it into any Worker or any `fetch`-based runtime to make an MCP server remote.
+- **`src/lib/safety.ts`** — the dry-run/confirm-token pattern, the SQL guard and the default-deny command allowlist. Reusable by any agent tool that can destroy something.
+- **`src/lib/content-utils.ts`** — targeted find/replace edits with loud failures, and WordPress URL→object resolution.
+- **`src/lib/theme-scaffold.ts`** — a complete classic PHP + Tailwind theme generator with tokenised design.
+- **`wp-plugin/wpxmcp-helper/`** — ~4,300 lines of PHP doing WP-CLI emulation, guarded SQL and a sandboxed theme-draft workflow, none of which core REST offers.
+- **`skills/`** — eight agent playbooks, notably the page-builder one, which encodes knowledge that is genuinely hard-won.
+
+Adding a tool is one `defineTool({...})`. It appears on both transports automatically.
+
+---
+
+## Project status
+
+**v1.0.0.** 48 tests, CI across Node 20/22/24 and PHP 7.4/8.3, both entry points built and the Worker deploy dry-run verified on every push.
+
+Honest about what has and has not been exercised: the TypeScript server, both transports and all guardrails are tested and were run end to end. The companion plugin lints clean on PHP 8.5 and follows WordPress APIs throughout, but has not yet been run against a live WordPress install — if you try it, [an issue](https://github.com/wpxmcp/wpxmcp/issues) with what you find is the single most useful contribution right now.
+
+Also welcome: more playbooks (WooCommerce, ACF, multisite), page-builder write paths that go through each builder's own save routine, and additional WP-CLI commands for the allowlist.
+
+---
+
 ## Documentation
 
 | Document | Contents |
@@ -294,6 +411,12 @@ Adding a tool is one `defineTool({...})` in the right `src/tools/*.ts` — it is
 
 ---
 
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the setup, the conventions, and what makes a good tool description. If wpxmcp is useful to you, a star helps other people find it.
+
 ## License
 
-MIT — see [LICENSE](LICENSE). Not affiliated with or endorsed by the WordPress Foundation, Automattic, or Cloudflare.
+MIT — see [LICENSE](LICENSE).
+
+Not affiliated with or endorsed by the WordPress Foundation, Automattic, or Cloudflare. "WordPress" is a trademark of the WordPress Foundation.
