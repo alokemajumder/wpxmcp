@@ -60,7 +60,7 @@ export function pluginTools(ctx: ToolContext) {
       },
       handler: async ({ site_id, plugin }) => {
         const client = site(site_id);
-        const res = await client.get<any>(`/wp/v2/plugins/${encodeURIComponent(plugin.replace(/\.php$/, ""))}`, { context: "edit" });
+        const res = await client.get<any>(`/wp/v2/plugins/${plugin.replace(/\.php$/, "")}`, { context: "edit" });
         return ok(shapePlugin(res.data));
       },
     }),
@@ -78,7 +78,7 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin, network_wide }) => {
         const client = site(site_id);
         client.assertWritable("activate_plugin");
-        const id = encodeURIComponent(plugin.replace(/\.php$/, ""));
+        const id = plugin.replace(/\.php$/, "");
         const res = await client.post<any>(`/wp/v2/plugins/${id}`, { status: network_wide ? "network-active" : "active" });
         audit({ site: client.site.id, tool: "activate_plugin", action: "activate", target: plugin, outcome: "ok" });
         return ok({ activated: true, ...shapePlugin(res.data) });
@@ -96,7 +96,7 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin }) => {
         const client = site(site_id);
         client.assertWritable("deactivate_plugin");
-        const id = encodeURIComponent(plugin.replace(/\.php$/, ""));
+        const id = plugin.replace(/\.php$/, "");
         const res = await client.post<any>(`/wp/v2/plugins/${id}`, { status: "inactive" });
         audit({ site: client.site.id, tool: "deactivate_plugin", action: "deactivate", target: plugin, outcome: "ok" });
         return ok({ deactivated: true, ...shapePlugin(res.data) });
@@ -154,7 +154,7 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin, confirm }) => {
         const client = site(site_id);
         client.assertWritable("delete_plugin");
-        const id = encodeURIComponent(plugin.replace(/\.php$/, ""));
+        const id = plugin.replace(/\.php$/, "");
         if (!confirm) {
           const current = await client.get<any>(`/wp/v2/plugins/${id}`, { context: "edit" });
           return ok({ deleted: false, requires_confirmation: true, plugin: shapePlugin(current.data) },

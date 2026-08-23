@@ -215,7 +215,7 @@ export function powerTools(ctx: ToolContext) {
         const abilityNs = await abilitiesNamespace(client);
         // The name already carries its namespace, and the slash is part of the
         // route rather than a value, so each segment is encoded separately.
-        const res = await client.get<any>(`/${abilityNs}/${encodeAbilityName(name)}`);
+        const res = await client.get<any>(abilityRoute(abilityNs, name));
         return ok(res.data);
       },
     }),
@@ -235,34 +235,31 @@ export function powerTools(ctx: ToolContext) {
       handler: async ({ site_id, name, input, method }) => {
         const client = site(site_id);
         const abilityNs = await abilitiesNamespace(client);
-        const route = `/${abilityNs}/${encodeAbilityName(name)}/run`;
 
-        let verb = method === "auto" ? "POST" : method;
-        let destructive = false;
+        let verb: "GET" | "POST" | "DELETE" = method === "auto" ? "POST" : method;
+        let annotations: Record<string, unknown> | undefined;
 
         if (method === "auto") {
+          // Core rejects the wrong verb with a 405, so read the annotations first.
           try {
-            const info = await client.get<any>(`/${abilityNs}/${encodeAbilityName(name)}`);
-            const meta = info.data?.meta ?? {};
-            const annotations = meta.annotations ?? info.data?.annotations ?? {};
-            destructive = Boolean(annotations.destructiveHint ?? meta.destructive);
-            const readOnly = Boolean(annotations.readOnlyHint ?? meta.readonly ?? meta.read_only);
-            verb = destructive ? "DELETE" : readOnly && !input ? "GET" : "POST";
+            const info = await client.get<any>(abilityRoute(abilityNs, name));
+            annotations = info.data?.meta?.annotations ?? info.data?.annotations;
+            verb = methodForAbility(annotations);
           } catch {
-            // The definition was unreadable; POST is the safe general case.
             verb = "POST";
           }
         }
 
         if (verb !== "GET") client.assertWritable(`run_ability ${name}`);
 
+        const route = abilityRoute(abilityNs, name, true);
         const res = verb === "POST"
           ? await client.post<any>(route, { input: input ?? {} })
           // GET and DELETE carry input as a URL-encoded JSON query parameter.
-          : await client.request<any>(route, { method: verb as "GET" | "DELETE", query: input ? { input: JSON.stringify(input) } : undefined });
+          : await client.request<any>(route, { method: verb, query: input ? { input: JSON.stringify(input) } : undefined });
 
         audit({ site: client.site.id, tool: "run_ability", action: name, outcome: "ok", detail: verb });
-        return ok({ ran: true, ability: name, method: verb, destructive: destructive || undefined, result: res.data });
+        return ok({ ran: true, ability: name, method: verb, annotations, result: res.data });
       },
     }),
 
@@ -468,22 +465,34 @@ async function abilitiesNamespace(client: WordPressClient): Promise<string> {
   const found = discovery.namespaces.find((n) => n.startsWith("wp-abilities/") || n === "wp-abilities" || n.startsWith("abilities/"));
   if (!found) {
     throw new Error(
-      "This site does not expose the WordPress Abilities API. It ships as a feature plugin (WordPress/abilities-api) and is proposed for core; until it is present, use the plugin's own REST namespace via discover_rest_routes and rest_api, or run_wp_cli."
+      "This site does not expose the WordPress Abilities API. It is built into WordPress 7.0+ and available as a feature plugin for older versions; on a site without it, use the plugin's own REST namespace via discover_rest_routes and rest_api, or run_wp_cli."
     );
   }
   return found;
 }
 
 /**
- * Abilities are named "namespace/ability". The slash is part of the route, so
- * the segments are encoded individually rather than as one opaque string.
+ * Builds the route for one ability.
+ *
+ * Core registers `/wp-abilities/v1/abilities/(?P<name>[a-zA-Z0-9\-\/]+)`, so the
+ * ability's own slash is matched by the route pattern and must be passed through
+ * raw. Percent-encoding it produces a 404 — verified against WordPress 7.1.
  */
-function encodeAbilityName(name: string): string {
-  return name
-    .split("/")
-    .filter(Boolean)
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
+function abilityRoute(namespace: string, name: string, run = false): string {
+  const clean = name.trim().replace(/^\/+|\/+$/g, "");
+  return `/${namespace}/abilities/${clean}${run ? "/run" : ""}`;
+}
+
+/**
+ * The HTTP method core requires for an ability, from its annotations.
+ * Mirrors WP_REST_Abilities_V1_Run_Controller::validate_request_method():
+ * readonly wins, then destructive+idempotent, otherwise POST.
+ */
+function methodForAbility(annotations: Record<string, unknown> | undefined): "GET" | "POST" | "DELETE" {
+  if (!annotations) return "POST";
+  if (annotations.readonly) return "GET";
+  if (annotations.destructive && annotations.idempotent) return "DELETE";
+  return "POST";
 }
 
 /** Best-effort SELECT preview of what an UPDATE/DELETE would touch. */

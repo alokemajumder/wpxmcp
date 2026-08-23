@@ -129,6 +129,24 @@ export function siteTools(ctx: ToolContext) {
           }
         }
 
+        // WordPress ships a Site Health test for exactly the failure that causes
+        // most 401s: a host stripping the Authorization header before PHP sees it.
+        if (client.hasCredentials()) {
+          try {
+            const header = await client.get<any>("/wp-site-health/v1/tests/authorization-header");
+            const status = header.data?.status;
+            checks.push({
+              check: "Authorization header passthrough",
+              status: status === "good" ? "pass" : "warn",
+              detail: status === "good"
+                ? "The server passes the Authorization header through to PHP."
+                : `WordPress reports: ${String(header.data?.label ?? status)}. If writes fail with 401 despite correct credentials, this is the usual cause — add the passthrough rule from docs/WORDPRESS_AUTH.md. Note that this test makes a loopback request, so it reports a false warning on single-threaded dev servers such as \`php -S\`; if authentication above passed, the header is in fact arriving.`,
+            });
+          } catch {
+            // Older WordPress, or the route is unavailable; not worth failing over.
+          }
+        }
+
         const namespaces: string[] = root?.namespaces ?? [];
         const helperNs = client.site.helperNamespace ?? "wpxmcp/v1";
         checks.push({
@@ -137,6 +155,15 @@ export function siteTools(ctx: ToolContext) {
           detail: namespaces.includes(helperNs)
             ? `The wpxmcp helper plugin is active (${helperNs}), so SQL, WP-CLI emulation, theme drafts, page HTML and field registration are available.`
             : `The wpxmcp helper plugin is not installed. Core REST tools all work; execute_sql_query, run_wp_cli, the draft theme tools, get_page_html and field registration need it. Install wp-plugin/wpxmcp-helper from this repo.`,
+        });
+
+        const abilityNs = namespaces.find((n) => n.startsWith("wp-abilities"));
+        checks.push({
+          check: "Abilities API",
+          status: abilityNs ? "pass" : "warn",
+          detail: abilityNs
+            ? `Available at ${abilityNs}. discover_abilities and run_ability can call any ability a plugin registers — the safest way to write plugin-owned data.`
+            : "Not present. It is built into WordPress 7.0+; on older versions plugin data must go through the plugin's own REST namespace or WP-CLI.",
         });
 
         try {

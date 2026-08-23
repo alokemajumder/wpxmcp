@@ -188,7 +188,7 @@ export function userTools(ctx: ToolContext) {
         const ns = client.site.helperNamespace ?? "wpxmcp/v1";
         if (await client.hasHelperPlugin()) {
           const res = await client.get<any>(`/${ns}/roles`);
-          return ok({ site: client.site.id, source: "companion plugin", roles: res.data });
+          return ok({ site: client.site.id, source: "companion plugin", roles: res.data?.roles ?? res.data });
         }
         return ok({
           site: client.site.id,

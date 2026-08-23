@@ -109,7 +109,9 @@ fastcgi_param HTTP_AUTHORIZATION $http_authorization;
 
 **LiteSpeed** — the Apache rule usually works; some hosts also need `CGIPassAuth On`.
 
-`test_site` detects this pattern and names it specifically rather than reporting a generic authentication failure.
+`test_site` checks this directly using WordPress's own Site Health test (`wp-site-health/v1/tests/authorization-header`) and names it specifically rather than reporting a generic authentication failure.
+
+That test performs a loopback request, so it reports a false warning on single-threaded development servers such as `php -S`. If the authentication check above it passed, the header is in fact arriving.
 
 ---
 

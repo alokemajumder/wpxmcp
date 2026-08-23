@@ -438,7 +438,7 @@ export function appearanceTools(ctx: ToolContext) {
       handler: async ({ site_id, id, kind }) => {
         const client = site(site_id);
         const route = kind === "template" ? "/wp/v2/templates" : "/wp/v2/template-parts";
-        const res = await client.get<any>(`${route}/${encodeURIComponent(id)}`, { context: "edit" });
+        const res = await client.get<any>(`${route}/${id}`, { context: "edit" });
         return ok({
           id: res.data.id, slug: res.data.slug, title: stripHtml(unwrap(res.data.title)),
           theme: res.data.theme, source: res.data.source, area: res.data.area,
@@ -466,7 +466,7 @@ export function appearanceTools(ctx: ToolContext) {
         const route = kind === "template" ? "/wp/v2/templates" : "/wp/v2/template-parts";
         const body: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(fields)) if (v !== undefined) body[k] = v;
-        const res = await client.post<any>(`${route}/${encodeURIComponent(id)}`, body);
+        const res = await client.post<any>(`${route}/${id}`, body);
         audit({ site: client.site.id, tool: "update_template", action: "update", target: id, outcome: "ok" });
         return ok({ updated: true, id: res.data.id, source: res.data.source },
           "The customisation is stored in the database, so the theme's original file is untouched and the change can be reverted from the Site Editor.");
