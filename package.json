@@ -1,0 +1,51 @@
+{
+  "name": "wpxmcp",
+  "version": "1.0.0",
+  "description": "MCP server for managing self-hosted WordPress sites \u2014 content, taxonomies, media, users, comments, plugins, themes, menus, widgets, design and SQL. Multi-site.",
+  "type": "module",
+  "bin": {
+    "wpxmcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "wp-plugin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run bundle:skills && tsc",
+    "bundle:skills": "node scripts/bundle-skills.mjs",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "doctor": "node dist/index.js --doctor",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "npm run bundle:skills && wrangler deploy",
+    "cf:tail": "wrangler tail",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "wordpress",
+    "model-context-protocol",
+    "wp-rest-api",
+    "claude"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "undici": "^7.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260823.1",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "wrangler": "^4.125.0"
+  }
+}

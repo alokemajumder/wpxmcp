@@ -1,0 +1,39 @@
+{
+  "sites": [
+    {
+      "id": "main",
+      "name": "Main site",
+      "url": "https://example.com",
+      "username": "admin",
+      "appPassword": "abcd EFGH ijkl MNOP qrst UVWX"
+    },
+    {
+      "id": "prod",
+      "name": "Production (read-only)",
+      "url": "https://www.example.com",
+      "username": "editor",
+      "appPassword": "abcd EFGH ijkl MNOP qrst UVWX",
+      "writable": false
+    },
+    {
+      "id": "staging",
+      "name": "Staging",
+      "url": "https://staging.example.com",
+      "username": "admin",
+      "appPassword": "abcd EFGH ijkl MNOP qrst UVWX",
+      "allowInsecureTLS": true,
+      "timeoutMs": 90000
+    },
+    {
+      "id": "legacy",
+      "name": "Site without pretty permalinks",
+      "url": "https://legacy.example.com",
+      "username": "admin",
+      "appPassword": "abcd EFGH ijkl MNOP qrst UVWX",
+      "restPrefix": "/?rest_route=",
+      "headers": {
+        "CF-Access-Client-Id": "optional-extra-header"
+      }
+    }
+  ]
+}

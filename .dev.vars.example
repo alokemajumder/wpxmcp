@@ -1,0 +1,6 @@
+# Local Worker development secrets (wrangler dev reads this file).
+# Never commit the real .dev.vars — it is gitignored.
+# In production these are Worker Secrets, not a file. See docs/DEPLOY_CLOUDFLARE.md.
+
+WPX_AUTH_TOKEN=generate-with-openssl-rand-hex-32
+WPX_SITES=[{"id":"main","url":"https://example.com","username":"admin","appPassword":"abcd EFGH ijkl MNOP"}]

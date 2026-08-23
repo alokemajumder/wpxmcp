@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/wpxmcp/wpxmcp/security/advisories/new
+    about: Please report security issues privately, never as a public issue.
+  - name: Setup help
+    url: https://github.com/wpxmcp/wpxmcp/blob/main/docs/CONFIGURATION.md
+    about: Configuration options, auth failures, and the Authorization header passthrough.

@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task, not only the feature — the underlying goal often suggests a better shape.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What did you try instead?
+      description: Existing tools, `rest_api`, `run_wp_cli`, a workaround.
+    validations:
+      required: false
