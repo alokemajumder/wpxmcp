@@ -5,7 +5,7 @@ Thanks for helping. This document covers the setup, the shape of the codebase, a
 ## Setup
 
 ```bash
-git clone https://github.com/wpxmcp/wpxmcp.git
+git clone https://github.com/alokemajumder/wpxmcp.git
 cd wpxmcp
 npm install
 npm run build

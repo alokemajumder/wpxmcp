@@ -24,7 +24,7 @@ Examples of unacceptable behaviour:
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the project maintainers through [GitHub Security Advisories](https://github.com/wpxmcp/wpxmcp/security/advisories/new) or by opening a confidential issue. All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behaviour may be reported to the project maintainers through [GitHub Security Advisories](https://github.com/alokemajumder/wpxmcp/security/advisories/new) or by opening a confidential issue. All complaints will be reviewed and investigated promptly and fairly.
 
 Maintainers are obligated to respect the privacy and security of the reporter of any incident.
 
