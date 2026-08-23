@@ -1,6 +1,15 @@
-# Local Worker development secrets (wrangler dev reads this file).
-# Never commit the real .dev.vars — it is gitignored.
-# In production these are Worker Secrets, not a file. See docs/DEPLOY_CLOUDFLARE.md.
+# Secrets for the Cloudflare Worker.
+#
+# Locally: copy this to .dev.vars (gitignored) and run `npm run cf:dev`.
+# In production these are Worker Secrets, never a file:
+#   npx wrangler secret put WPX_AUTH_TOKEN
+#   npx wrangler secret put WPX_SITES
+# The one-click deploy flow reads this file to know which secrets to prompt for.
 
-WPX_AUTH_TOKEN=generate-with-openssl-rand-hex-32
-WPX_SITES=[{"id":"main","url":"https://example.com","username":"admin","appPassword":"abcd EFGH ijkl MNOP"}]
+# Shared secret clients must send as `Authorization: Bearer <token>`.
+# Generate with: openssl rand -hex 32
+WPX_AUTH_TOKEN=""
+
+# The WordPress sites this server manages, as a JSON array.
+# appPassword comes from wp-admin > Users > Profile > Application Passwords.
+WPX_SITES='[{"id":"main","url":"https://example.com","username":"admin","appPassword":"abcd EFGH ijkl MNOP qrst UVWX"}]'

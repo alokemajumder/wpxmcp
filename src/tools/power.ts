@@ -186,7 +186,8 @@ export function powerTools(ctx: ToolContext) {
             "This site does not expose the Abilities API — no plugin has registered abilities, or the plugins predate it. Use the plugin's own REST namespace (discover_rest_routes) or run_wp_cli instead.");
         }
 
-        const res = await client.get<any>(`/${abilityNs}/abilities`, { search });
+        // GET /wp-abilities/v1/abilities — the documented listing route.
+        const res = await client.get<any>(`/${abilityNs}/abilities`, { search, per_page: 100 });
         const list = Array.isArray(res.data) ? res.data : res.data?.abilities ?? [];
         return ok({
           site: client.site.id, namespace: abilityNs, count: list.length,
@@ -203,17 +204,18 @@ export function powerTools(ctx: ToolContext) {
       name: "get_ability_info",
       title: "Get ability details",
       readOnly: true,
-      description: "Get the full definition of one ability, including its input and output schemas, so you can call it correctly the first time.",
+      description:
+        "Get the full definition of one ability, including its input and output schemas and whether it is destructive, so you can call it correctly the first time. Ability names are namespaced, e.g. \"my-plugin/get-site-info\".",
       schema: {
         site_id: siteIdSchema,
-        name: z.string().describe("Ability name, as returned by discover_abilities."),
+        name: z.string().describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
       },
       handler: async ({ site_id, name }) => {
         const client = site(site_id);
-        const discovery = await client.discovery();
-        const abilityNs = discovery.namespaces.find((n) => n.startsWith("wp-abilities") || n.startsWith("abilities"));
-        if (!abilityNs) throw new Error("This site does not expose the Abilities API. Run discover_abilities for alternatives.");
-        const res = await client.get<any>(`/${abilityNs}/abilities/${encodeURIComponent(name)}`);
+        const abilityNs = await abilitiesNamespace(client);
+        // The name already carries its namespace, and the slash is part of the
+        // route rather than a value, so each segment is encoded separately.
+        const res = await client.get<any>(`/${abilityNs}/${encodeAbilityName(name)}`);
         return ok(res.data);
       },
     }),
@@ -222,21 +224,45 @@ export function powerTools(ctx: ToolContext) {
       name: "run_ability",
       title: "Run a plugin ability",
       description:
-        "Execute an ability registered through the WordPress Abilities API. This is the preferred way to write data owned by a plugin — the plugin's own validation, hooks and cache invalidation run, which raw SQL would bypass. Check get_ability_info for the input schema first.",
+        "Execute an ability registered through the WordPress Abilities API. This is the preferred way to write data a plugin owns — the plugin's own validation, hooks and cache invalidation all run, which raw SQL would bypass. Check get_ability_info for the input schema first. The Abilities API maps intent onto HTTP methods: read-only abilities use GET, ordinary ones POST, and destructive ones DELETE; this is chosen automatically unless you override it.",
       schema: {
         site_id: siteIdSchema,
-        name: z.string().describe("Ability name from discover_abilities."),
+        name: z.string().describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
         input: z.record(z.any()).optional().describe("Arguments matching the ability's input_schema."),
+        method: z.enum(["auto", "GET", "POST", "DELETE"]).optional().default("auto")
+          .describe("HTTP method. \"auto\" reads the ability's definition and picks GET for read-only, DELETE for destructive, POST otherwise."),
       },
-      handler: async ({ site_id, name, input }) => {
+      handler: async ({ site_id, name, input, method }) => {
         const client = site(site_id);
-        client.assertWritable(`run_ability ${name}`);
-        const discovery = await client.discovery();
-        const abilityNs = discovery.namespaces.find((n) => n.startsWith("wp-abilities") || n.startsWith("abilities"));
-        if (!abilityNs) throw new Error("This site does not expose the Abilities API.");
-        const res = await client.post<any>(`/${abilityNs}/abilities/${encodeURIComponent(name)}/run`, { input: input ?? {} });
-        audit({ site: client.site.id, tool: "run_ability", action: name, outcome: "ok" });
-        return ok({ ran: true, ability: name, result: res.data });
+        const abilityNs = await abilitiesNamespace(client);
+        const route = `/${abilityNs}/${encodeAbilityName(name)}/run`;
+
+        let verb = method === "auto" ? "POST" : method;
+        let destructive = false;
+
+        if (method === "auto") {
+          try {
+            const info = await client.get<any>(`/${abilityNs}/${encodeAbilityName(name)}`);
+            const meta = info.data?.meta ?? {};
+            const annotations = meta.annotations ?? info.data?.annotations ?? {};
+            destructive = Boolean(annotations.destructiveHint ?? meta.destructive);
+            const readOnly = Boolean(annotations.readOnlyHint ?? meta.readonly ?? meta.read_only);
+            verb = destructive ? "DELETE" : readOnly && !input ? "GET" : "POST";
+          } catch {
+            // The definition was unreadable; POST is the safe general case.
+            verb = "POST";
+          }
+        }
+
+        if (verb !== "GET") client.assertWritable(`run_ability ${name}`);
+
+        const res = verb === "POST"
+          ? await client.post<any>(route, { input: input ?? {} })
+          // GET and DELETE carry input as a URL-encoded JSON query parameter.
+          : await client.request<any>(route, { method: verb as "GET" | "DELETE", query: input ? { input: JSON.stringify(input) } : undefined });
+
+        audit({ site: client.site.id, tool: "run_ability", action: name, outcome: "ok", detail: verb });
+        return ok({ ran: true, ability: name, method: verb, destructive: destructive || undefined, result: res.data });
       },
     }),
 
@@ -428,6 +454,36 @@ export function powerTools(ctx: ToolContext) {
       },
     }),
   ];
+}
+
+
+/**
+ * The site's Abilities API namespace.
+ *
+ * The API registers `wp-abilities/v1`; this tolerates a future version bump
+ * rather than hardcoding it, and explains the alternatives when it is absent.
+ */
+async function abilitiesNamespace(client: WordPressClient): Promise<string> {
+  const discovery = await client.discovery();
+  const found = discovery.namespaces.find((n) => n.startsWith("wp-abilities/") || n === "wp-abilities" || n.startsWith("abilities/"));
+  if (!found) {
+    throw new Error(
+      "This site does not expose the WordPress Abilities API. It ships as a feature plugin (WordPress/abilities-api) and is proposed for core; until it is present, use the plugin's own REST namespace via discover_rest_routes and rest_api, or run_wp_cli."
+    );
+  }
+  return found;
+}
+
+/**
+ * Abilities are named "namespace/ability". The slash is part of the route, so
+ * the segments are encoded individually rather than as one opaque string.
+ */
+function encodeAbilityName(name: string): string {
+  return name
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 /** Best-effort SELECT preview of what an UPDATE/DELETE would touch. */
