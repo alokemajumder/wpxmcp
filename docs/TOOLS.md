@@ -2,7 +2,9 @@
 
 117 tools. Every content, taxonomy, media, user, comment, plugin, theme, appearance and admin tool accepts an optional **`site_id`**; with one site configured it can be omitted.
 
-Tools marked 🔌 require the [companion plugin](COMPANION_PLUGIN.md). Tools marked ⚠️ are destructive and require explicit confirmation.
+Tools marked 🔌 require the [companion plugin](COMPANION_PLUGIN.md) — 24 of the 117. The other 93 work against a stock WordPress install with nothing added. Four of those 93 (`site_info`, `get_content_meta`, `list_roles`, `discover_abilities`) work without it but return more when it is present, and say so in their output.
+
+Tools marked ⚠️ are destructive and require explicit confirmation.
 
 ---
 
@@ -158,7 +160,7 @@ create_media: {
 
 ---
 
-## Themes and design (14)
+## Themes and design (15)
 
 | Tool | Purpose |
 | --- | --- |
@@ -190,21 +192,21 @@ create_draft_theme  →  write/edit files  →  get_preview_url  →  publish_dr
 
 ---
 
-## Appearance (20)
+## Appearance (23)
 
-**Menus** — `list_menus`, `get_menu`, `create_menu`, `update_menu`, `delete_menu` ⚠️, `add_menu_item`, `update_menu_item`, `delete_menu_item`, `reorder_menu_items`
+**Menus (9)** — `list_menus`, `get_menu`, `create_menu`, `update_menu`, `delete_menu` ⚠️, `add_menu_item`, `update_menu_item`, `delete_menu_item`, `reorder_menu_items`
 
 `get_menu` renders the hierarchy as an indented tree rather than a flat list with parent ids.
 
-**Widgets** — `list_sidebars`, `list_widgets`, `create_widget`, `update_widget`, `delete_widget` ⚠️
+**Widgets (5)** — `list_sidebars`, `list_widgets`, `create_widget`, `update_widget`, `delete_widget` ⚠️
 
-**Block themes** — `list_templates`, `get_template`, `update_template`, `get_global_styles`, `update_global_styles`, `list_block_types`, `list_reusable_blocks`
+**Block themes (7)** — `list_templates`, `get_template`, `update_template`, `get_global_styles`, `update_global_styles`, `list_block_types`, `list_reusable_blocks`
 
-**Customizer** 🔌 — `get_theme_mods`, `set_theme_mod`
+**Customizer (2)** 🔌 — `get_theme_mods`, `set_theme_mod`
 
 ---
 
-## Site configuration and intelligence (12)
+## Site configuration and intelligence (11)
 
 | Tool | Purpose |
 | --- | --- |
@@ -224,29 +226,29 @@ create_draft_theme  →  write/edit files  →  get_preview_url  →  publish_dr
 
 ---
 
-## Power tools (14)
+## Power tools (12)
 
-**WP-CLI** 🔌 — `list_cli_commands`, `run_wp_cli`
+**WP-CLI (2)** 🔌 — `list_cli_commands`, `run_wp_cli`
 
 50+ commands emulated in PHP. No binary, no SSH, no shell. Default-deny allowlist; `search-replace` always dry-runs before it will write.
 
-**SQL** 🔌 — `execute_sql_query`
+**SQL (1)** 🔌 — `execute_sql_query`
 
 SELECT-only with an enforced row limit. Mutations need `allow_mutation: true`, a `confirm_token` from the preview, **and** `WPXMCP_ALLOW_SQL_WRITES` in `wp-config.php`. Stacked statements are always refused.
 
-**Abilities API** — `discover_abilities`, `get_ability_info`, `run_ability`
+**Abilities API (3)** — `discover_abilities`, `get_ability_info`, `run_ability`
 
 The right way to write data a plugin owns: its validation, hooks and cache invalidation all run.
 
-**Snippets** 🔌 — `code_snippet`
+**Snippets (1)** 🔌 — `code_snippet`
 
 PHP, CSS and JS without touching theme files. Always created **disabled**; a human enables them in wp-admin.
 
-**Editable fields** 🔌 — `register_fields`, `list_field_groups`, `delete_field_group`
+**Editable fields (3)** 🔌 — `register_fields`, `list_field_groups`, `delete_field_group`
 
 Thirteen field types rendering as native meta boxes or a settings page, auto-exposed to REST, stored as ordinary post meta and options.
 
-**Options** 🔌 — `get_options`, `set_option`
+**Options (2)** 🔌 — `get_options`, `set_option`
 
 ---
 

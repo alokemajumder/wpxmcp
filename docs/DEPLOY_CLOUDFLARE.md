@@ -14,9 +14,26 @@ MCP client  ──HTTPS + Bearer──▶  Cloudflare Worker  ──Application 
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wpxmcp/wpxmcp)
 
-This forks the repository to your account, provisions the Worker, and wires up Workers Builds so every push redeploys. It does **not** set your secrets — the button cannot, and should not, handle credentials. Continue at [step 3](#3-store-your-credentials-as-secrets).
+The button clones this repository into your own GitHub or GitLab account, creates the Worker, and configures Workers Builds so every push to your production branch redeploys.
 
-> Deploying your own fork? Update the button URL in `README.md` and in this file to point at your repository.
+Cloudflare reads the secrets it needs from two files in the repository:
+
+- **`.dev.vars.example`** lists the secret names in dotenv format (`WPX_AUTH_TOKEN`, `WPX_SITES`).
+- **`package.json`** describes each one under `cloudflare.bindings`, so the setup screen explains what to paste.
+
+You should therefore be prompted for both secrets during setup. **Confirm afterwards** with the health check in [step 4](#4-deploy) — if `auth_configured` is `false`, set them with `wrangler secret put` as in [step 3](#3-store-your-credentials-as-secrets). Never commit a real secret to the repository; the button flow is the only place credentials should be entered.
+
+Requirements for the button to work at all, which this repository already satisfies:
+
+| Requirement | Here |
+| --- | --- |
+| Public GitHub or GitLab repository | Yours must be public for others to use your button |
+| `wrangler.json` or `wrangler.toml` at the root | [`wrangler.json`](../wrangler.json) |
+| A `deploy` script, or it falls back to `npx wrangler deploy` | `npm run deploy` |
+| Secrets declared in `.dev.vars.example` | [`.dev.vars.example`](../.dev.vars.example) |
+| Binding descriptions in `package.json` | `cloudflare.bindings` |
+
+> **Deploying your own fork?** Update the button URL in `README.md` and in this file to point at your repository — the button deploys whatever repository the `?url=` parameter names.
 
 ---
 
@@ -29,7 +46,7 @@ npm install
 npx wrangler login
 ```
 
-Optionally rename the Worker in `wrangler.jsonc` (`"name": "wpxmcp"`) — this becomes your subdomain.
+Optionally rename the Worker in `wrangler.json` (`"name": "wpxmcp"`) — this becomes your subdomain.
 
 ---
 
@@ -92,7 +109,7 @@ Give the account the least role that does the job. `manage_options` is required 
 ## 4. Deploy
 
 ```bash
-npm run cf:deploy
+npm run deploy
 ```
 
 Wrangler prints your URL. Confirm it is alive:
@@ -152,7 +169,7 @@ claude mcp add --transport http wpxmcp https://wpxmcp.<your-subdomain>.workers.d
 
 ### Browser-based clients
 
-Set the origins allowed to call your Worker, in `wrangler.jsonc`:
+Set the origins allowed to call your Worker, in `wrangler.json`:
 
 ```jsonc
 "vars": {
@@ -184,7 +201,7 @@ The Worker runs at `http://localhost:8787/mcp`. `.dev.vars` is gitignored — ke
 
 A `workers.dev` subdomain is fine, but a custom hostname is stable across renames and easier to rotate behind.
 
-Add a route to `wrangler.jsonc`:
+Add a route to `wrangler.json`:
 
 ```jsonc
 "routes": [
@@ -204,13 +221,15 @@ Workers isolates are evicted freely, so the in-memory audit ring is best-effort.
 npx wrangler kv namespace create WPX_AUDIT
 ```
 
-Uncomment the block at the bottom of `wrangler.jsonc` and paste the id Wrangler printed:
+Add this to `wrangler.json`, pasting the id Wrangler printed:
 
-```jsonc
+```json
 "kv_namespaces": [
   { "binding": "WPX_AUDIT", "id": "abc123..." }
 ]
 ```
+
+`wrangler.json` is strict JSON — no comments and no trailing commas, or the deploy button's parser will reject it.
 
 Entries are written with a 90-day TTL. Independently of this, the companion plugin keeps its own append-only log on each WordPress site, which is the record that matters when you are reconstructing what changed.
 
