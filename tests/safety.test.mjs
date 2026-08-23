@@ -79,18 +79,45 @@ test("eval stays disabled unless explicitly enabled", () => {
   assert.match(verdict.reason ?? "", /WPX_ALLOW_EVAL/);
 });
 
-test("a confirmation token is single use", () => {
+test("a confirmation token is single use", async () => {
   const fp = fingerprintOp(["a", 1]);
-  const token = issueConfirmation("site", "summary", fp);
-  assert.equal(consumeConfirmation(token, fp).valid, true);
-  assert.equal(consumeConfirmation(token, fp).valid, false, "a token must not be reusable");
+  const token = await issueConfirmation("site", "summary", fp);
+  assert.equal((await consumeConfirmation(token, fp)).valid, true);
+  assert.equal((await consumeConfirmation(token, fp)).valid, false, "a token must not be reusable");
 });
 
-test("a confirmation token does not transfer to different arguments", () => {
-  const token = issueConfirmation("site", "summary", fingerprintOp(["a", 1]));
-  const result = consumeConfirmation(token, fingerprintOp(["a", 2]));
+test("a confirmation token does not transfer to different arguments", async () => {
+  const token = await issueConfirmation("site", "summary", fingerprintOp(["a", 1]));
+  const result = await consumeConfirmation(token, fingerprintOp(["a", 2]));
   assert.equal(result.valid, false);
   assert.match(result.reason ?? "", /arguments changed/);
+});
+
+test("a confirmation token issued by one isolate verifies in another", async () => {
+  // Regression: tokens were held in a module-scope Map, so on Cloudflare a
+  // dry-run and its confirm landing on different isolates failed at random.
+  const other = await import("../dist/lib/safety.js?isolate=2");
+  const fp = fingerprintOp(["bulk", "site", { status: "draft" }]);
+  const token = await issueConfirmation("site", "bulk update", fp);
+  assert.equal((await other.consumeConfirmation(token, fp)).valid, true,
+    "a signed token must verify anywhere in the deployment, not only where it was issued");
+});
+
+test("a tampered confirmation token is rejected", async () => {
+  const fp = fingerprintOp(["a", 1]);
+  const token = await issueConfirmation("site", "summary", fp);
+  const result = await consumeConfirmation(token.slice(0, -4) + "AAAA", fp);
+  assert.equal(result.valid, false);
+  assert.match(result.reason ?? "", /signature/);
+});
+
+test("malformed confirmation tokens are rejected rather than throwing", async () => {
+  const fp = fingerprintOp(["a", 1]);
+  for (const bad of ["", "nonsense", "confirm-oldstyle-abc", "confirm.only-two", "confirm..", "a.b.c"]) {
+    const result = await consumeConfirmation(bad, fp);
+    assert.equal(result.valid, false, `"${bad}" should be rejected`);
+    assert.ok(result.reason, "a rejection must explain itself");
+  }
 });
 
 test("fingerprints are stable and argument-sensitive", () => {

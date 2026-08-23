@@ -369,10 +369,37 @@ export function siteConfigTools(ctx: ToolContext) {
         if (method !== "GET") {
           audit({ site: client.site.id, tool: "rest_api", action: `${method} ${route}`, target: route, outcome: "ok" });
         }
+        // Truncate structurally, never by slicing the serialised JSON: cutting a
+        // string mid-token produces something that cannot be parsed back.
+        const serialised = JSON.stringify(res.data) ?? "null";
+        let data: unknown = res.data;
+        let truncation: string | undefined;
+
+        if (serialised.length > max_chars) {
+          if (Array.isArray(res.data)) {
+            // Keep whole elements until the budget is spent.
+            const kept: unknown[] = [];
+            let used = 2;
+            for (const item of res.data) {
+              const size = JSON.stringify(item).length + 1;
+              if (used + size > max_chars) break;
+              kept.push(item);
+              used += size;
+            }
+            data = kept;
+            truncation = `Response held ${res.data.length} items; ${kept.length} are shown. Narrow the query, or raise max_chars.`;
+          } else {
+            data = undefined;
+            truncation = `Response was ${serialised.length} characters, above max_chars (${max_chars}), and is not an array so it could not be trimmed by element. A preview is in \`data_preview\`; raise max_chars to receive it in full.`;
+          }
+        }
+
         return ok({
           route, method, status: res.status,
           total: res.total, total_pages: res.totalPages,
-          data: JSON.parse(trimText(JSON.stringify(res.data), max_chars).replace(/\n…\[truncated[\s\S]*$/, "") || "null") ?? res.data,
+          truncation,
+          data,
+          data_preview: data === undefined ? trimText(serialised, max_chars) : undefined,
         });
       },
     }),

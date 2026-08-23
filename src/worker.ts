@@ -54,6 +54,13 @@ function installWorkerPlatform(env: Env): Platform {
       return memoryAudit.read(limit, site);
     },
 
+    confirmSecret() {
+      // WPX_AUTH_TOKEN is a Worker Secret: identical in every isolate and across
+      // redeploys, so a token issued by one isolate verifies in any other. The
+      // Worker refuses to serve without it, so it is always present here.
+      return `wpxmcp-confirm:${env.WPX_AUTH_TOKEN ?? ""}`;
+    },
+
     // No readLocalFile: a remote Worker has no access to the caller's disk.
     // create_media explains this and points at `url` / `base64_data` instead.
 

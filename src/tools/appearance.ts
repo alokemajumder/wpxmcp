@@ -301,7 +301,9 @@ export function appearanceTools(ctx: ToolContext) {
             id: s.id, name: s.name, description: stripHtml(String(s.description ?? "")),
             status: s.status, widget_count: (s.widgets ?? []).length, widgets: s.widgets ?? [],
           })),
-        }, res.data.length === 0 ? "This theme registers no classic widget areas — it is probably a block theme, where the equivalent lives in template parts." : undefined);
+        }, res.data.length === 0
+          ? "This theme registers no classic widget areas — it is probably a block theme, where the equivalent lives in template parts."
+          : "A sidebar listed here may still be inactive: WordPress remembers areas registered by previously active themes. Widgets added to one the current theme does not render are relocated to wp_inactive_widgets, and create_widget reports when that happens.");
       },
     }),
 
@@ -348,8 +350,33 @@ export function appearanceTools(ctx: ToolContext) {
         if (instance) body.instance = { raw: instance };
         if (position !== undefined) body.position = position;
         const res = await client.post<any>("/wp/v2/widgets", body);
-        audit({ site: client.site.id, tool: "create_widget", action: "create", target: res.data.id, outcome: "ok", detail: `${id_base} → ${sidebar}` });
-        return ok({ created: true, id: res.data.id, id_base: res.data.id_base, sidebar: res.data.sidebar, instance_settings: res.data.instance?.raw });
+        const id = res.data.id;
+
+        // WordPress answers with the sidebar that was asked for, then quietly
+        // relocates the widget to wp_inactive_widgets when the target is not
+        // rendered by the active theme — which is every classic sidebar under a
+        // block theme. Re-read it so the caller is told where it actually is.
+        let placed = res.data.sidebar;
+        try {
+          const actual = await client.get<any>(`/wp/v2/widgets/${id}`, { context: "edit" });
+          placed = actual.data?.sidebar ?? placed;
+        } catch {
+          /* keep the create response's answer */
+        }
+
+        audit({ site: client.site.id, tool: "create_widget", action: "create", target: id, outcome: "ok", detail: `${id_base} → ${placed}` });
+
+        const relocated = placed !== sidebar;
+        return ok({
+          created: true,
+          id,
+          id_base: res.data.id_base,
+          requested_sidebar: sidebar,
+          sidebar: placed,
+          instance_settings: res.data.instance?.raw,
+        }, relocated
+          ? `WordPress placed this widget in "${placed}" rather than "${sidebar}". That happens when the target sidebar is not rendered by the active theme — most often a classic sidebar under a block theme, where widget areas live in template parts instead. Check list_sidebars, or use update_template for a block theme.`
+          : undefined);
       },
     }),
 
@@ -373,8 +400,27 @@ export function appearanceTools(ctx: ToolContext) {
         if (position !== undefined) body.position = position;
         if (Object.keys(body).length === 0) throw new Error("No changes were supplied.");
         const res = await client.post<any>(`/wp/v2/widgets/${id}`, body);
+
+        let placed = res.data.sidebar;
+        if (sidebar !== undefined) {
+          try {
+            const actual = await client.get<any>(`/wp/v2/widgets/${id}`, { context: "edit" });
+            placed = actual.data?.sidebar ?? placed;
+          } catch {
+            /* keep the update response's answer */
+          }
+        }
+
         audit({ site: client.site.id, tool: "update_widget", action: "update", target: id, outcome: "ok" });
-        return ok({ updated: true, id: res.data.id, sidebar: res.data.sidebar, instance_settings: res.data.instance?.raw });
+        return ok({
+          updated: true,
+          id: res.data.id,
+          requested_sidebar: sidebar,
+          sidebar: placed,
+          instance_settings: res.data.instance?.raw,
+        }, sidebar !== undefined && placed !== sidebar
+          ? `WordPress kept this widget in "${placed}" rather than moving it to "${sidebar}" — that sidebar is not rendered by the active theme.`
+          : undefined);
       },
     }),
 

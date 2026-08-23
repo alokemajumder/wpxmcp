@@ -28,30 +28,77 @@ export function readAudit(limit = 100, siteFilter?: string): AuditEntry[] {
 }
 
 /* ------------------------------------------------------------------ *
- * Confirmation tokens for irreversible work
+ * Confirmation tokens
  * ------------------------------------------------------------------ */
 
-interface PendingOp {
-  token: string;
-  createdAt: number;
-  site: string;
-  summary: string;
-  fingerprint: string;
+/**
+ * Tokens are self-contained and signed rather than held in memory.
+ *
+ * The remote deployment is stateless: every request builds a fresh server, and
+ * Cloudflare may route the follow-up call to a different isolate or evict the
+ * one that issued the token. An in-memory map therefore validates a token only
+ * when the confirm happens to land on the same isolate — intermittent failure,
+ * which is the worst possible behaviour for a destructive-action guard.
+ *
+ * A token instead carries its own site, fingerprint and expiry, signed with a
+ * secret that is stable across the deployment, so any isolate can verify any
+ * token without shared state.
+ */
+
+const CONFIRM_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Best-effort replay guard, mapping a spent token to when it expires.
+ *
+ * Correctness does not depend on this surviving — the signature and expiry do
+ * that. Entries are pruned by expiry rather than cleared wholesale, because
+ * clearing would make every previously spent token replayable again.
+ */
+const spent = new Map<string, number>();
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-const pending = new Map<string, PendingOp>();
-const CONFIRM_TTL_MS = 10 * 60 * 1000;
+function fromBase64Url(value: string): Uint8Array {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+async function sign(payload: string, secret: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return toBase64Url(new Uint8Array(signature));
+}
+
+/** Constant-time comparison, so a signature cannot be discovered by timing. */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 /**
  * A stable fingerprint of a pending operation's arguments.
  *
- * This is not a security boundary — it exists so that a confirm_token issued for
- * one preview cannot be replayed against different arguments. The unguessable
- * part is the token itself, which uses the CSPRNG below.
+ * Not the security boundary — the HMAC signature is. This exists so a token
+ * issued for one preview cannot be replayed against different arguments.
  */
 export function fingerprintOp(parts: unknown[]): string {
   const input = JSON.stringify(parts);
-  // FNV-1a, 64-bit, so it works identically on Node and Workers without a hash API.
+  // FNV-1a, 64-bit: identical on Node and Workers without needing a hash API.
   let hash = 0xcbf29ce484222325n;
   const prime = 0x100000001b3n;
   const mask = 0xffffffffffffffffn;
@@ -61,27 +108,58 @@ export function fingerprintOp(parts: unknown[]): string {
   return hash.toString(16).padStart(16, "0");
 }
 
-/** Issues a short-lived token the caller must echo back to actually run a destructive op. */
-export function issueConfirmation(site: string, summary: string, fingerprint: string): string {
-  const bytes = new Uint8Array(9);
-  crypto.getRandomValues(bytes);
-  const token = "confirm-" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  pending.set(token, { token, createdAt: Date.now(), site, summary, fingerprint });
-  return token;
+/** Issues a short-lived signed token the caller must echo back to proceed. */
+export async function issueConfirmation(site: string, summary: string, fingerprint: string): Promise<string> {
+  const payload = toBase64Url(
+    new TextEncoder().encode(JSON.stringify({ s: site, f: fingerprint, x: Date.now() + CONFIRM_TTL_MS }))
+  );
+  const signature = await sign(payload, platform().confirmSecret());
+  return `confirm.${payload}.${signature}`;
 }
 
-export function consumeConfirmation(token: string, fingerprint: string): { valid: boolean; reason?: string } {
-  const op = pending.get(token);
-  if (!op) return { valid: false, reason: "That confirm_token is unknown or has already been used. Re-run the tool without a token to get a fresh dry-run preview." };
-  pending.delete(token);
-  if (Date.now() - op.createdAt > CONFIRM_TTL_MS) {
+export async function consumeConfirmation(token: string, fingerprint: string): Promise<{ valid: boolean; reason?: string }> {
+  const parts = String(token ?? "").split(".");
+  if (parts.length !== 3 || parts[0] !== "confirm") {
+    return { valid: false, reason: "That confirm_token is malformed. Re-run the tool without a token to get a fresh dry-run preview." };
+  }
+
+  const [, payload, signature] = parts;
+
+  let expected: string;
+  try {
+    expected = await sign(payload, platform().confirmSecret());
+  } catch {
+    return { valid: false, reason: "The confirmation token could not be verified on this server." };
+  }
+  if (!safeEqual(signature, expected)) {
+    return { valid: false, reason: "That confirm_token failed its signature check — it was not issued by this server. Re-run the tool without a token to get a fresh preview." };
+  }
+
+  let decoded: { s: string; f: string; x: number };
+  try {
+    decoded = JSON.parse(new TextDecoder().decode(fromBase64Url(payload)));
+  } catch {
+    return { valid: false, reason: "That confirm_token is malformed." };
+  }
+
+  if (Date.now() > decoded.x) {
     return { valid: false, reason: "That confirm_token expired (tokens last 10 minutes). Re-run for a fresh preview." };
   }
-  if (op.fingerprint !== fingerprint) {
+  if (decoded.f !== fingerprint) {
     return {
       valid: false,
       reason: "The arguments changed since the preview was generated, so the token no longer matches. Re-run without a token to preview the new operation, then confirm that.",
     };
+  }
+  if (spent.has(token)) {
+    return { valid: false, reason: "That confirm_token has already been used. Re-run the tool without a token to get a fresh preview." };
+  }
+
+  spent.set(token, decoded.x);
+  if (spent.size > 500) {
+    // Drop only what can no longer be replayed anyway.
+    const now = Date.now();
+    for (const [key, expiry] of spent) if (expiry <= now) spent.delete(key);
   }
   return { valid: true };
 }

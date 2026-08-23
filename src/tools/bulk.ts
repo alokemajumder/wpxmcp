@@ -128,7 +128,7 @@ export function bulkTools(ctx: ToolContext) {
         const fingerprint = fingerprintOp(["bulk", client.site.id, args.type, args.filter, args.changes, args.content_edits, args.limit]);
 
         if (!args.confirm_token) {
-          const token = issueConfirmation(client.site.id, `bulk update ${actionable.length} ${args.type}`, fingerprint);
+          const token = await issueConfirmation(client.site.id, `bulk update ${actionable.length} ${args.type}`, fingerprint);
           audit({ site: client.site.id, tool: "bulk_update_content", action: "preview", outcome: "dry-run", detail: `${actionable.length} items` });
           return ok({
             applied: false, dry_run: true,
@@ -138,7 +138,7 @@ export function bulkTools(ctx: ToolContext) {
           }, `Nothing was written. ${actionable.length} item(s) would change. Review the plan, then re-run the identical call with this confirm_token to apply it. The token lasts 10 minutes and is bound to these exact arguments.`);
         }
 
-        const check = consumeConfirmation(args.confirm_token, fingerprint);
+        const check = await consumeConfirmation(args.confirm_token, fingerprint);
         if (!check.valid) return ok({ applied: false, refused: true, reason: check.reason }, "The confirmation was not accepted, so nothing was written.");
 
         const results: any[] = [];
