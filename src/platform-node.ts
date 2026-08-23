@@ -8,6 +8,17 @@ export const WPX_HOME = process.env.WPX_HOME
   ? path.resolve(process.env.WPX_HOME)
   : path.join(os.homedir(), ".wpxmcp");
 
+/** Stable for the lifetime of this process, used only if the key file is unwritable. */
+let cachedProcessKey: string | null = null;
+function processKey(): string {
+  if (!cachedProcessKey) {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    cachedProcessKey = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return cachedProcessKey;
+}
+
 function ensureHome(): string {
   if (!fs.existsSync(WPX_HOME)) fs.mkdirSync(WPX_HOME, { recursive: true, mode: 0o700 });
   return WPX_HOME;
@@ -76,6 +87,23 @@ export function installNodePlatform(): Platform {
         filename: path.basename(resolved),
         contentType: guessMimeType(resolved),
       };
+    },
+
+    confirmSecret() {
+      // Persisted so a token issued before a restart still verifies afterwards.
+      const file = path.join(ensureHome(), "confirm.key");
+      try {
+        if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+        const bytes = new Uint8Array(32);
+        crypto.getRandomValues(bytes);
+        const key = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+        fs.writeFileSync(file, key, { mode: 0o600 });
+        return key;
+      } catch {
+        // Read-only home directory: fall back to a per-process key. Tokens then
+        // last only as long as the process, which is still correct for stdio.
+        return processKey();
+      }
     },
 
     skills: {

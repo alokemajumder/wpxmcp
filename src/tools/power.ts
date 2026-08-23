@@ -73,14 +73,14 @@ export function powerTools(ctx: ToolContext) {
 
         if (needsConfirmation && !confirm_token) {
           const dry = await client.post<any>(`/${ns}/cli`, { command: `${command} --dry-run`, format });
-          const token = issueConfirmation(client.site.id, `wp ${command}`, fingerprint);
+          const token = await issueConfirmation(client.site.id, `wp ${command}`, fingerprint);
           audit({ site: client.site.id, tool: "run_wp_cli", action: command, outcome: "dry-run" });
           return ok({
             ran: false, dry_run: true, command, preview: dry.data, confirm_token: token,
           }, "This is a dry run — nothing was changed. Review the replacement count above, then re-run the identical command with this confirm_token to apply it. The token is valid for 10 minutes and only for these exact arguments.");
         }
         if (needsConfirmation && confirm_token) {
-          const check = consumeConfirmation(confirm_token, fingerprint);
+          const check = await consumeConfirmation(confirm_token, fingerprint);
           if (!check.valid) return ok({ ran: false, refused: true, reason: check.reason }, "The confirmation was not accepted, so nothing ran.");
         }
 
@@ -133,14 +133,14 @@ export function powerTools(ctx: ToolContext) {
                 preview = res.data;
               } catch (e: any) { preview = { preview_error: e.message }; }
             }
-            const token = issueConfirmation(client.site.id, verdict.normalized, fingerprint);
+            const token = await issueConfirmation(client.site.id, verdict.normalized, fingerprint);
             audit({ site: client.site.id, tool: "execute_sql_query", action: "mutation preview", outcome: "dry-run", detail: verdict.normalized.slice(0, 200) });
             return ok({
               ran: false, requires_confirmation: true, statement: verdict.normalized,
               rows_that_would_be_affected: preview, confirm_token: token,
             }, "Nothing was executed. Above are the rows this statement targets, as far as they could be previewed. Re-run the identical query with this confirm_token to execute it. Raw SQL skips WordPress hooks, so remember to flush caches afterwards.");
           }
-          const check = consumeConfirmation(confirm_token, fingerprint);
+          const check = await consumeConfirmation(confirm_token, fingerprint);
           if (!check.valid) return ok({ ran: false, refused: true, reason: check.reason }, "The confirmation was not accepted, so nothing ran.");
         }
 

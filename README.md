@@ -378,7 +378,9 @@ Adding a tool is one `defineTool({...})`. It appears on both transports automati
 
 Every guardrail was confirmed to actually hold: writes to a live theme refused, four path-traversal attempts refused, the extension allowlist refused `.sh`, protected options refused via both `set_option` and WP-CLI, `db drop` and shell metacharacters refused by the allowlist, stacked SQL refused, mutating SQL previewed rather than run, and the tokenised preview URL rendering the draft while the public URL kept serving the live theme.
 
-That exercise found and fixed five real bugs, including ability routes that matched the published documentation but not core's actual registration.
+A second, deeper audit pass exercised all 117 tools against that install — reads, writes, refusals and error paths — then the full dry-run → confirm → apply cycle for bulk edits, SQL and `search-replace`, then the same server again over Streamable HTTP. Between them these found and fixed **twelve real bugs**, including ability routes that matched the published documentation but not core's actual registration, and confirmation tokens that could not survive between Cloudflare isolates.
+
+The suites live in [`audit/`](audit/) and are re-runnable against any throwaway WordPress; they are idempotent, and `npm run audit` executes them.
 
 Welcome next: more playbooks (WooCommerce, ACF, multisite), page-builder write paths that go through each builder's own save routine, and additional WP-CLI commands for the allowlist.
 

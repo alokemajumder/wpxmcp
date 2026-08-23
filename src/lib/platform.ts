@@ -29,6 +29,13 @@ export interface Platform {
   readAudit(limit: number, site?: string): AuditEntry[];
   /** Read a file from the machine running the server. Unavailable on Workers. */
   readLocalFile?(path: string): { data: Uint8Array; filename: string; contentType: string };
+  /**
+   * A stable secret used to sign confirmation tokens.
+   *
+   * It must be identical across every process and isolate serving this
+   * deployment, or a token issued by one will be rejected by another.
+   */
+  confirmSecret(): string;
   /** Persisted user skills. Bundled skills are always available; saving needs a filesystem. */
   skills: {
     canSave: boolean;

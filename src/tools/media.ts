@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { defineTool, ok, siteIdSchema, stripHtml, unwrap, type ToolContext } from "../lib/tooling.js";
+import { platform } from "../lib/platform.js";
 import { readLocalFile, guessMimeType, sanitizeFilename, type WordPressClient } from "../lib/client.js";
 import { audit } from "../lib/safety.js";
 
@@ -315,8 +316,11 @@ export function mediaTools(ctx: ToolContext) {
         orientation: z.enum(["landscape", "portrait", "squarish"]).optional().describe("Preferred aspect ratio."),
       },
       handler: async ({ query, provider, per_page, orientation }) => {
-        const unsplashKey = process.env.UNSPLASH_ACCESS_KEY;
-        const pexelsKey = process.env.PEXELS_API_KEY;
+        // Must come from the platform: on Workers these are Worker Secrets in
+        // `env`, and process.env is empty there.
+        const runtimeEnv = platform().env;
+        const unsplashKey = runtimeEnv.UNSPLASH_ACCESS_KEY;
+        const pexelsKey = runtimeEnv.PEXELS_API_KEY;
         const chosen = provider === "auto" ? (unsplashKey ? "unsplash" : pexelsKey ? "pexels" : null) : provider;
 
         if (!chosen) {

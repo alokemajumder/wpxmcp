@@ -2,6 +2,21 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
+/**
+ * Whether this runtime has a filesystem worth consulting.
+ *
+ * Cloudflare Workers has no real filesystem; probing for a sites.json there is
+ * pointless and, depending on the compatibility shims, can throw. Configuration
+ * arrives through the environment instead.
+ */
+function hasFilesystem(): boolean {
+  try {
+    return typeof process !== "undefined" && Boolean(process.versions?.node) && typeof fs.existsSync === "function";
+  } catch {
+    return false;
+  }
+}
+
 export interface SiteConfig {
   /** Stable identifier used as `site_id` in every tool. */
   id: string;
@@ -83,7 +98,7 @@ function coerceSite(raw: any, fallbackId: string): SiteConfig {
  *   4. WP_SITE_<ID>_URL / _USERNAME / _APP_PASSWORD env triples
  *   5. WORDPRESS_URL / WORDPRESS_USERNAME / WORDPRESS_APP_PASSWORD (single site)
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig {
+export function loadConfig(env: NodeJS.ProcessEnv = (typeof process !== "undefined" ? process.env : {}) as NodeJS.ProcessEnv): ResolvedConfig {
   const collected: { sites: SiteConfig[]; source: string } | null =
     fromInlineJson(env) ?? fromFile(env) ?? fromWellKnownFiles() ?? fromIndexedEnv(env) ?? fromSingleEnv(env);
 
@@ -141,12 +156,18 @@ function readJsonFile(file: string, source: string) {
 function fromFile(env: NodeJS.ProcessEnv) {
   const file = env.WPX_SITES_FILE;
   if (!file) return null;
+  if (!hasFilesystem()) {
+    throw new Error(
+      `WPX_SITES_FILE is set to "${file}", but this runtime has no filesystem. On Cloudflare Workers, put the site list in the WPX_SITES secret instead.`
+    );
+  }
   const resolved = file.startsWith("~") ? path.join(os.homedir(), file.slice(1)) : path.resolve(file);
   if (!fs.existsSync(resolved)) throw new Error(`WPX_SITES_FILE points at "${resolved}" which does not exist.`);
   return readJsonFile(resolved, `WPX_SITES_FILE (${resolved})`);
 }
 
 function fromWellKnownFiles() {
+  if (!hasFilesystem()) return null;
   const candidates = [
     path.join(os.homedir(), ".wpxmcp", "sites.json"),
     path.join(process.cwd(), "wpxmcp.sites.json"),
