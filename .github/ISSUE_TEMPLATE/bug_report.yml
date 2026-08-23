@@ -1,0 +1,60 @@
+name: Bug report
+description: Something is not working as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please run `test_site` (or `npm run doctor`) — it names most
+        configuration problems directly, and its output helps a great deal here.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: input
+    id: tool
+    attributes:
+      label: Which tool
+      placeholder: update_content
+    validations:
+      required: false
+
+  - type: textarea
+    id: error
+    attributes:
+      label: The full error or output
+      description: Paste it verbatim. Redact URLs and credentials.
+      render: text
+    validations:
+      required: false
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How are you running wpxmcp?
+      options:
+        - Local (stdio)
+        - Remote (Cloudflare Workers)
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "wpxmcp 1.0.0, WordPress 6.7, PHP 8.2, Node 24"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: plugin
+    attributes:
+      label: Is the companion plugin installed?
+      options: ['Yes', 'No', 'Not sure']
+    validations:
+      required: true
