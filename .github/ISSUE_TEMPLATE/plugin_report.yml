@@ -1,0 +1,50 @@
+name: Companion plugin report
+description: Something about the WordPress-side plugin — install, endpoints, or behaviour
+labels: [companion-plugin]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The companion plugin is optional and only needed for WP-CLI, SQL, theme files,
+        unregistered meta, options, theme mods, snippets and editable fields.
+        Please run `test_site` first — it reports whether the plugin is active.
+
+  - type: input
+    id: wp
+    attributes:
+      label: WordPress and PHP versions
+      placeholder: "WordPress 6.7, PHP 8.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - Installation or activation
+        - WP-CLI emulation
+        - SQL queries
+        - Theme files or the draft workflow
+        - Editable fields
+        - Code snippets
+        - Post meta or options
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: What happened
+      description: Include the tool call, the error, and anything in the PHP error log.
+    validations:
+      required: true
+
+  - type: input
+    id: host
+    attributes:
+      label: Host or stack
+      description: Shared host, managed WordPress, Local, Docker — filesystem permissions differ a lot between them.
+    validations:
+      required: false

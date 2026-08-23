@@ -1,0 +1,31 @@
+version: 2
+
+updates:
+  # Runtime and build dependencies.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    groups:
+      # One PR for the routine bumps, so review effort goes to the ones that matter.
+      dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+      production-patches:
+        dependency-type: production
+        update-types: [patch]
+    ignore:
+      # The MCP SDK sets the protocol revision this server speaks; take those
+      # deliberately rather than automatically.
+      - dependency-name: "@modelcontextprotocol/sdk"
+        update-types: [version-update:semver-major]
+
+  # The pinned actions in the CI workflow.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies, ci]
