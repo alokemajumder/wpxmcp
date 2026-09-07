@@ -45,11 +45,11 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260823.1",
+    "@cloudflare/workers-types": "^5.20260904.1",
     "@types/node": "^22.10.0",
-    "tsx": "^4.19.2",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.2",
-    "wrangler": "^4.125.0"
+    "wrangler": "^4.129.0"
   },
   "repository": {
     "type": "git",
