@@ -50,6 +50,11 @@ export function applyEdits(original: string, edits: EditOp[]): EditResult {
         continue;
       }
       const matches = content.match(new RegExp(edit.find, "gs"));
+      if (matches && matches.length > 1 && !edit.all) {
+        throw new Error(
+          `Edit is ambiguous — the regex "${truncate(edit.find, 120)}" matches ${matches.length} times. Anchor it to more surrounding text, or pass all: true to replace every match.`
+        );
+      }
       occurrences = matches ? (edit.all ? matches.length : 1) : 0;
       if (occurrences === 0) {
         skipped.push({ find: edit.find, reason: "Pattern did not match." });
@@ -78,7 +83,9 @@ export function applyEdits(original: string, edits: EditOp[]): EditResult {
         );
       }
       occurrences = edit.all ? count : 1;
-      content = edit.all ? content.split(edit.find).join(edit.replace) : content.replace(edit.find, edit.replace);
+      // A function replacer, because a string one expands $&, $' and $` even for a
+      // literal pattern — a code sample containing '$' would splice in the rest of the post.
+      content = edit.all ? content.split(edit.find).join(edit.replace) : content.replace(edit.find, () => edit.replace);
     }
     applied.push({ find: truncate(edit.find, 80), occurrences, regex: Boolean(edit.regex) });
   }
@@ -149,7 +156,13 @@ export async function resolveUrl(client: WordPressClient, rawUrl: string): Promi
   }
 
   const segments = url.pathname.split("/").filter(Boolean).filter((s) => !/^(page|amp)$/.test(s) && !/^\d+$/.test(s));
-  const slug = decodeURIComponent(segments[segments.length - 1] ?? "");
+  const lastSegment = segments[segments.length - 1] ?? "";
+  let slug: string;
+  try {
+    slug = decodeURIComponent(lastSegment);
+  } catch {
+    slug = lastSegment; // a stray "%" is not an escape; use the segment as written
+  }
 
   if (!slug) {
     notes.push("The URL points at the site root, which is the front page rather than a single piece of content. Check get_site_settings for `page_on_front`.");
@@ -180,7 +193,7 @@ export async function resolveUrl(client: WordPressClient, rawUrl: string): Promi
     if (!type?.rest_base) continue;
     candidatesTried.push(`${typeName}?slug=${slug}`);
     try {
-      const res = await client.get<any[]>(`/wp/v2/${type.rest_base}`, { slug, per_page: 5, status: "any", context: "edit" });
+      const res = await client.get<any[]>(typeRoute(type), { slug, per_page: 5, status: "any", context: "edit" });
       const item = res.data?.[0];
       if (item) {
         return { found: true, id: item.id, type: typeName, restBase: type.rest_base, item, strategy: `slug lookup in "${typeName}"`, candidatesTried, notes };
@@ -188,7 +201,7 @@ export async function resolveUrl(client: WordPressClient, rawUrl: string): Promi
     } catch (e: any) {
       // status=any needs auth; retry anonymously before giving up on this type.
       try {
-        const res = await client.get<any[]>(`/wp/v2/${type.rest_base}`, { slug, per_page: 5 });
+        const res = await client.get<any[]>(typeRoute(type), { slug, per_page: 5 });
         const item = res.data?.[0];
         if (item) {
           return { found: true, id: item.id, type: typeName, restBase: type.rest_base, item, strategy: `slug lookup in "${typeName}" (public context)`, candidatesTried, notes };
@@ -216,7 +229,7 @@ function normalizeUrlForCompare(u: string): string {
 
 /** Puts the post type whose rewrite base appears in the URL first, then the usual suspects. */
 function orderTypesByRewriteBase(types: Record<string, any>, segments: string[]): string[] {
-  const names = Object.keys(types).filter((n) => !["attachment", "wp_block", "wp_template", "wp_template_part", "wp_navigation", "wp_global_styles", "wp_font_family", "wp_font_face"].includes(n));
+  const names = Object.keys(types).filter((n) => !["attachment", "wp_block", "wp_template", "wp_template_part", "wp_navigation", "wp_global_styles", "wp_font_family", "wp_font_face", "nav_menu_item"].includes(n));
   const score = (name: string): number => {
     const t = types[name];
     const rewriteSlug: string | undefined = t?.rewrite?.slug ?? t?.slug;
@@ -231,17 +244,23 @@ function orderTypesByRewriteBase(types: Record<string, any>, segments: string[])
   return names.sort((a, b) => score(b) - score(a));
 }
 
+/** Collection route for a post type, honouring a custom rest_namespace (WordPress 5.9+). */
+function typeRoute(type: any): string {
+  const ns = typeof type?.rest_namespace === "string" && type.rest_namespace.trim() ? type.rest_namespace.trim().replace(/^\/+|\/+$/g, "") : "wp/v2";
+  return `/${ns}/${type.rest_base}`;
+}
+
 async function tryFetchById(client: WordPressClient, types: Record<string, any>, typeName: string, id: number) {
   const type = types[typeName] ?? Object.values(types).find((t: any) => t.rest_base === typeName);
   const restBase = (type as any)?.rest_base;
   if (!restBase) return null;
   const resolvedName = Object.keys(types).find((k) => types[k].rest_base === restBase) ?? typeName;
   try {
-    const res = await client.get(`/wp/v2/${restBase}/${id}`, { context: "edit" });
+    const res = await client.get(`${typeRoute(type)}/${id}`, { context: "edit" });
     return { id, type: resolvedName, restBase, item: res.data };
   } catch {
     try {
-      const res = await client.get(`/wp/v2/${restBase}/${id}`);
+      const res = await client.get(`${typeRoute(type)}/${id}`);
       return { id, type: resolvedName, restBase, item: res.data };
     } catch {
       return null;

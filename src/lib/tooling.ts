@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { SiteRegistry } from "./registry.js";
 import { WPError } from "./errors.js";
 
@@ -50,7 +50,26 @@ export interface ToolSpec<S extends z.ZodRawShape> {
   handler: Handler<S>;
   readOnly?: boolean;
   destructive?: boolean;
+  /**
+   * Whether the companion plugin is needed. Only set it when the handler reaches
+   * the plugin indirectly; docs otherwise infer it from the handler itself.
+   */
+  companion?: "required" | "enhanced";
   idempotent?: boolean;
+}
+
+/**
+ * The `.describe()` text of a parameter, looking through optional/default/
+ * nullable wrappers. A model chooses tools and fills arguments by reading these,
+ * so the test suite requires one on every parameter.
+ */
+export function schemaDescription(schema: unknown): string | undefined {
+  let current: any = schema;
+  for (let depth = 0; current && depth < 6; depth++) {
+    if (typeof current.description === "string" && current.description) return current.description;
+    current = current._zod?.def?.innerType ?? current.def?.innerType;
+  }
+  return undefined;
 }
 
 export function defineTool<S extends z.ZodRawShape>(spec: ToolSpec<S>): ToolSpec<S> {
@@ -64,7 +83,7 @@ export function registerTools(server: McpServer, tools: Array<ToolSpec<any>>) {
       {
         title: tool.title,
         description: tool.description,
-        inputSchema: tool.schema,
+        inputSchema: z.object(tool.schema),
         annotations: {
           title: tool.title,
           readOnlyHint: tool.readOnly ?? false,

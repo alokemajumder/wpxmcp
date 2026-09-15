@@ -1,6 +1,26 @@
 import { z } from "zod";
 import { defineTool, ok, siteIdSchema, stripHtml, unwrap, type ToolContext } from "../lib/tooling.js";
 import { audit } from "../lib/safety.js";
+import type { WordPressClient } from "../lib/client.js";
+
+/**
+ * Trashing goes through DELETE rather than status: "trash". With the trash
+ * disabled (EMPTY_TRASH_DAYS = 0) wp_trash_comment() deletes permanently,
+ * whereas DELETE without force refuses — the recoverable behaviour we promise.
+ */
+async function trashComment(client: WordPressClient, id: number) {
+  try {
+    return (await client.del<any>(`/wp/v2/comments/${id}`)).data;
+  } catch (e: any) {
+    if (e?.code === "rest_trash_not_supported") {
+      throw new Error(`The trash is disabled on this site, so comment ${id} was not removed. Deleting it would be permanent — use delete_comment with force: true and confirm: true if that is intended.`);
+    }
+    if (e?.code === "rest_already_trashed") {
+      throw new Error(`Comment ${id} is already in the trash. Use status "untrash" to restore it, or delete_comment with force: true and confirm: true to remove it for good.`);
+    }
+    throw e;
+  }
+}
 
 function shapeComment(c: any) {
   return {
@@ -35,7 +55,8 @@ export function commentTools(ctx: ToolContext) {
         status: z.enum(["approve", "hold", "spam", "trash", "all"]).optional().describe("Moderation status. Anything other than \"approve\" requires authentication."),
         search: z.string().optional().describe("Free-text search term."),
         author_email: z.string().optional().describe("Filter by commenter email. Administrator only."),
-        parent: z.number().int().optional().describe("Only replies to this comment ID."),
+        parent: z.number().int().optional().describe("Only replies to this comment ID (0 for top-level comments)."),
+        type: z.string().optional().describe("Comment type: \"comment\" (the default WordPress applies), \"pingback\", \"trackback\", or a custom type such as \"review\"."),
         after: z.string().optional().describe("ISO 8601 date."),
         before: z.string().optional().describe("ISO 8601 date."),
         per_page: z.number().int().min(1).max(100).optional().default(25).describe("How many results per page."),
@@ -46,7 +67,7 @@ export function commentTools(ctx: ToolContext) {
       handler: async (args) => {
         const client = site(args.site_id);
         const query: Record<string, unknown> = {
-          post: args.post, search: args.search, author_email: args.author_email, parent: args.parent,
+          post: args.post, search: args.search, author_email: args.author_email, parent: args.parent, type: args.type,
           after: args.after, before: args.before, per_page: args.per_page, page: args.page,
           orderby: args.orderby, order: args.order,
         };
@@ -106,12 +127,12 @@ export function commentTools(ctx: ToolContext) {
     defineTool({
       name: "update_comment",
       title: "Update a comment",
-      description: "Update a comment's text, author details or moderation status. Setting status to \"approve\" publishes a held comment; \"spam\" trains the spam filter; \"trash\" hides it recoverably.",
+      description: "Update a comment's text, author details or moderation status. Setting status to \"approve\" publishes a held comment; \"spam\" marks it as spam; \"trash\" hides it recoverably; \"unspam\" and \"untrash\" restore it to its previous status.",
       schema: {
         site_id: siteIdSchema,
         id: z.number().int().describe("The comment ID."),
         content: z.string().optional().describe("The body text."),
-        status: z.enum(["approve", "hold", "spam", "trash"]).optional().describe("Moderation status."),
+        status: z.enum(["approve", "hold", "spam", "unspam", "trash", "untrash"]).optional().describe("Moderation status or action."),
         author_name: z.string().optional().describe("Commenter display name."),
         author_email: z.string().optional().describe("Commenter email address."),
         author_url: z.string().optional().describe("Commenter website URL."),
@@ -124,9 +145,14 @@ export function commentTools(ctx: ToolContext) {
         const body: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(fields)) if (v !== undefined) body[k] = v;
         if (Object.keys(body).length === 0) throw new Error("No fields to update were supplied.");
-        const res = await client.post<any>(`/wp/v2/comments/${id}`, body);
-        audit({ site: client.site.id, tool: "update_comment", action: "update", target: id, outcome: "ok", detail: Object.keys(body).join(",") });
-        return ok({ updated: true, changed_fields: Object.keys(body), ...shapeComment(res.data) });
+        const trash = body.status === "trash";
+        if (trash) delete body.status;
+        let data: any;
+        if (Object.keys(body).length) data = (await client.post<any>(`/wp/v2/comments/${id}`, body)).data;
+        if (trash) data = await trashComment(client, id);
+        const changed = [...Object.keys(body), ...(trash ? ["status"] : [])];
+        audit({ site: client.site.id, tool: "update_comment", action: trash ? "update+trash" : "update", target: id, outcome: "ok", detail: changed.join(",") });
+        return ok({ updated: true, changed_fields: changed, ...shapeComment(data) });
       },
     }),
 
@@ -149,9 +175,9 @@ export function commentTools(ctx: ToolContext) {
           return ok({ deleted: false, requires_confirmation: true, comment: shapeComment(current.data) },
             "Permanent deletion is irreversible, so nothing was removed. Re-run with force: true AND confirm: true, or drop `force` to trash it recoverably.");
         }
-        const res = await client.del<any>(`/wp/v2/comments/${id}`, force ? { force: true } : undefined);
+        const data = force ? (await client.del<any>(`/wp/v2/comments/${id}`, { force: true })).data : await trashComment(client, id);
         audit({ site: client.site.id, tool: "delete_comment", action: force ? "permanent delete" : "trash", target: id, outcome: "ok" });
-        return ok({ deleted: true, permanent: Boolean(force), id, previous: res.data?.previous ? shapeComment(res.data.previous) : undefined });
+        return ok({ deleted: true, permanent: Boolean(force), id, previous: data?.previous ? shapeComment(data.previous) : undefined });
       },
     }),
 
@@ -159,11 +185,11 @@ export function commentTools(ctx: ToolContext) {
       name: "moderate_comments",
       title: "Bulk moderate comments",
       description:
-        "Approve, hold, spam or trash several comments in one call — the practical way to clear a moderation queue. Reports per-comment outcomes rather than failing the whole batch on one error.",
+        "Approve, hold, spam, trash — or unspam/untrash — several comments in one call; the practical way to clear a moderation queue. Reports per-comment outcomes rather than failing the whole batch on one error.",
       schema: {
         site_id: siteIdSchema,
         ids: z.array(z.number().int()).min(1).max(100).describe("Comment IDs to act on."),
-        action: z.enum(["approve", "hold", "spam", "trash"]).describe("What to do with each."),
+        action: z.enum(["approve", "hold", "spam", "unspam", "trash", "untrash"]).describe("What to do with each. unspam/untrash restore the comment's previous status."),
       },
       handler: async ({ site_id, ids, action }) => {
         const client = site(site_id);
@@ -172,8 +198,8 @@ export function commentTools(ctx: ToolContext) {
         for (const id of ids) {
           try {
             if (action === "trash") {
-              await client.del(`/wp/v2/comments/${id}`);
-              results.push({ id, ok: true, status: "trash" });
+              const data = await trashComment(client, id);
+              results.push({ id, ok: true, status: data?.status ?? "trash" });
             } else {
               const res = await client.post<any>(`/wp/v2/comments/${id}`, { status: action });
               results.push({ id, ok: true, status: res.data.status });

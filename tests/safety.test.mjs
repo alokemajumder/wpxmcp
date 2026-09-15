@@ -73,10 +73,10 @@ test("CLI allowlist rejects shell metacharacters", () => {
   assert.match(verdict.reason ?? "", /metacharacters/);
 });
 
-test("eval stays disabled unless explicitly enabled", () => {
+test("eval is never on the allowlist, since the plugin does not implement it", () => {
   const verdict = inspectCliCommand("eval return_something");
   assert.equal(verdict.allowed, false);
-  assert.match(verdict.reason ?? "", /WPX_ALLOW_EVAL/);
+  assert.match(verdict.reason ?? "", /not on the allowlist/);
 });
 
 test("a confirmation token is single use", async () => {

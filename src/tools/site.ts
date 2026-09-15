@@ -1,6 +1,73 @@
 import { z } from "zod";
 import { defineTool, ok, siteIdSchema, stripHtml, unwrap, trimText, type ToolContext } from "../lib/tooling.js";
 import { audit } from "../lib/safety.js";
+import type { WordPressClient } from "../lib/client.js";
+import { readCapped } from "../lib/http-utils.js";
+
+/** Largest page body get_page_html will read, so a huge or endless response cannot exhaust memory. */
+const MAX_PAGE_BYTES = 5 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+
+/** Site Health tests core exposes over REST (the "async" ones Site Health runs in the browser). */
+const CORE_HEALTH_TESTS = ["background-updates", "loopback-requests", "https-status", "dotorg-communication", "authorization-header", "page-cache"];
+
+/** Whether `candidate` is on the same host as the site — the only place get_page_html may go. */
+export function isSameSite(siteUrl: string | URL, candidate: URL): boolean {
+  const base = new URL(String(siteUrl));
+  if (candidate.protocol !== "http:" && candidate.protocol !== "https:") return false;
+  if (candidate.username || candidate.password) return false;
+  const port = (u: URL) => u.port || (u.protocol === "https:" ? "443" : "80");
+  // http→https on the same host is the redirect nearly every site issues, so the scheme may differ;
+  // the host must not, and neither may a non-default port.
+  if (candidate.hostname.toLowerCase() !== base.hostname.toLowerCase()) return false;
+  const explicit = (u: URL) => u.port !== "";
+  if (explicit(candidate) || explicit(base)) return port(candidate) === port(base) && candidate.protocol === base.protocol;
+  return true;
+}
+
+/**
+ * Resolves a caller-supplied path or URL against the site and refuses anything
+ * that would leave it. Relative inputs are always treated as paths under the
+ * site — leading slashes and backslashes are collapsed first, so "//evil.com"
+ * and "\\evil.com" cannot become protocol-relative URLs to another host.
+ */
+export function resolveSiteUrl(siteUrl: string, input: string): URL {
+  const base = new URL(siteUrl.replace(/\/+$/, "") + "/");
+  const raw = String(input ?? "").trim() || "/";
+  const target = /^[a-z][a-z0-9+.-]*:/i.test(raw)
+    ? new URL(raw)
+    : new URL(raw.replace(/\\/g, "/").replace(/^\/+/, ""), base);
+  if (!isSameSite(base, target)) {
+    throw new Error(`Only pages on the configured site (${base.origin}) can be fetched; "${input}" points elsewhere. Pass a path such as "/about/".`);
+  }
+  return target;
+}
+
+/**
+ * The method WordPress will actually dispatch. The REST server honours a
+ * `_method` query parameter as a method override on any request, so a "GET"
+ * carrying `_method=DELETE` is a delete — and must be treated as a write.
+ */
+export function effectiveRestMethod(method: string, route: string, query?: Record<string, unknown>): string {
+  let override: string | undefined;
+  const q = route.indexOf("?");
+  if (q >= 0) {
+    for (const [k, v] of new URLSearchParams(route.slice(q + 1))) if (k.toLowerCase() === "_method") override = v;
+  }
+  for (const [k, v] of Object.entries(query ?? {})) {
+    if (k.toLowerCase() === "_method" && v !== undefined && v !== null && v !== "") override = String(v);
+  }
+  return (override ?? method).toUpperCase();
+}
+
+
+/** "/wp/v2/posts" for a post type, honouring a custom rest_namespace (WordPress 5.9+). */
+async function contentRoute(client: WordPressClient, type: string): Promise<string> {
+  const restBase = await client.restBaseForType(type);
+  const types = await client.postTypes();
+  const def = Object.values<any>(types).find((t) => t.rest_base === restBase);
+  return `/${def?.rest_namespace || "wp/v2"}/${restBase}`;
+}
 
 export function siteConfigTools(ctx: ToolContext) {
   const { registry } = ctx;
@@ -74,7 +141,7 @@ export function siteConfigTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         include_plugins: z.boolean().optional().default(true).describe("Include the plugin inventory."),
-        include_health: z.boolean().optional().default(true).describe("Include Site Health checks. Needs the companion plugin."),
+        include_health: z.boolean().optional().default(true).describe("Include Site Health checks: core's REST-exposed tests (loopback, HTTPS, updates, page cache, Authorization header) always, plus the direct tests when the companion plugin is active. Adds a few seconds."),
       },
       handler: async ({ site_id, include_plugins, include_health }) => {
         const client = site(site_id);
@@ -118,7 +185,27 @@ export function siteConfigTools(ctx: ToolContext) {
             Object.assign(payload, info.data);
           } catch (e: any) { unavailable.push(`companion diagnostics (${e.message})`); }
         } else {
-          unavailable.push("PHP version, database size, Site Health checks and update availability (install the wpxmcp companion plugin to see these)");
+          unavailable.push("PHP version, database size, direct Site Health checks and update availability (install the wpxmcp companion plugin to see these)");
+        }
+
+        if (include_health) {
+          try {
+            const routes = (await client.discovery()).routes;
+            const tests = CORE_HEALTH_TESTS.filter((name) => routes.includes(`/wp-site-health/v1/tests/${name}`));
+            if (tests.length) {
+              const settled = await Promise.allSettled(tests.map((name) => client.request<any>(`/wp-site-health/v1/tests/${name}`, { timeoutMs: 30_000 })));
+              const issues: any[] = [];
+              const passed: string[] = [];
+              const failed: string[] = [];
+              settled.forEach((r, i) => {
+                if (r.status === "rejected") { failed.push(`${tests[i]} (${r.reason?.message ?? r.reason})`); return; }
+                const t = r.value.data ?? {};
+                if (t.status === "good") passed.push(tests[i]);
+                else issues.push({ test: tests[i], status: t.status, label: stripHtml(String(t.label ?? "")), detail: trimText(stripHtml(String(t.description ?? "")), 500) });
+              });
+              payload.site_health_async = { issue_count: issues.length, issues, passed, could_not_run: failed.length ? failed : undefined };
+            }
+          } catch (e: any) { unavailable.push(`core Site Health tests (${e.message})`); }
         }
 
         try {
@@ -127,7 +214,7 @@ export function siteConfigTools(ctx: ToolContext) {
           for (const [name, t] of Object.entries<any>(types)) {
             if (["attachment", "wp_block", "wp_template", "wp_template_part", "wp_navigation", "wp_global_styles", "wp_font_family", "wp_font_face"].includes(name)) continue;
             try {
-              const res = await client.get(`/wp/v2/${t.rest_base}`, { per_page: 1, status: "any", context: "edit" });
+              const res = await client.get(`/${t.rest_namespace || "wp/v2"}/${t.rest_base}`, { per_page: 1, status: "any", context: "edit" });
               counts[name] = res.total ?? null;
             } catch { counts[name] = null; }
           }
@@ -144,37 +231,71 @@ export function siteConfigTools(ctx: ToolContext) {
       title: "Get rendered page HTML",
       readOnly: true,
       description:
-        "Fetch the fully rendered HTML that a visitor receives for any URL on the site, so you can verify that a change actually appears on the front end rather than trusting the API's word for it. Returns the server-rendered HTML — content injected later by JavaScript will not appear. Optionally extracts just the SEO-relevant head tags or the visible text.",
+        "Fetch the fully rendered HTML that a visitor receives for any URL on the configured site (other hosts, and redirects to them, are refused), so you can verify that a change actually appears on the front end rather than trusting the API's word for it. Returns the server-rendered HTML — content injected later by JavaScript will not appear. Optionally extracts just the SEO-relevant head tags or the visible text.",
       schema: {
         site_id: siteIdSchema,
         url: z.string().optional().default("/").describe("Path or full URL to fetch, e.g. \"/about/\"."),
         mode: z.enum(["html", "text", "head", "summary"]).optional().default("summary")
           .describe("html: the raw markup. text: visible text only. head: title/meta/OG tags. summary: head tags plus headings, links and image alt coverage."),
-        max_chars: z.number().int().optional().default(30000).describe("Truncate the response at this many characters."),
+        max_chars: z.number().int().min(1).optional().default(30000).describe("Truncate the response at this many characters."),
         preview_token: z.string().optional().describe("Token from get_preview_url, to render a draft theme instead of the live one."),
       },
       handler: async ({ site_id, url, mode, max_chars, preview_token }) => {
         const client = site(site_id);
-        let target = url.startsWith("http") ? url : `${client.site.url}${url.startsWith("/") ? "" : "/"}${url}`;
-        if (preview_token) {
-          const u = new URL(target);
-          u.searchParams.set("wpxmcp_preview", preview_token);
-          target = u.toString();
+        const start = resolveSiteUrl(client.site.url, url);
+        if (preview_token) start.searchParams.set("wpxmcp_preview", preview_token);
+        const target = start.toString();
+
+        // Redirects are followed by hand so each hop can be checked: a page on the
+        // site that redirects to another host (or an internal address) must not
+        // turn this into a proxy for fetching it.
+        const timeoutMs = client.site.timeoutMs ?? 60_000;
+        let current = start;
+        let res: Response;
+        let blockedRedirect: string | undefined;
+        let hops = 0;
+        try {
+          for (;;) {
+            res = await fetch(current, {
+              headers: { "User-Agent": "wpxmcp/2.0 (page inspector)", Accept: "text/html", ...(client.site.headers ?? {}) },
+              redirect: "manual",
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+            const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+            if (!location) break;
+            const next = new URL(location, current);
+            if (!isSameSite(client.site.url, next) || hops >= MAX_REDIRECTS) {
+              blockedRedirect = next.toString();
+              break;
+            }
+            await res.body?.cancel().catch(() => undefined);
+            current = next;
+            hops++;
+          }
+        } catch (e: any) {
+          if (e?.name === "TimeoutError" || e?.name === "AbortError") throw new Error(`Fetching ${current} timed out after ${timeoutMs}ms.`);
+          throw new Error(`Could not fetch ${current}: ${e?.cause?.code ?? e?.message ?? String(e)}.`);
         }
 
-        const res = await fetch(target, {
-          headers: { "User-Agent": "wpxmcp/1.0 (page inspector)", Accept: "text/html" },
-          redirect: "follow",
-        });
-        const html = await res.text();
+        if (blockedRedirect) {
+          await res!.body?.cancel().catch(() => undefined);
+          return ok({ url: target, final_url: current.toString(), status: res!.status, redirected: hops > 0, redirect_not_followed: blockedRedirect },
+            hops >= MAX_REDIRECTS
+              ? `Stopped after ${MAX_REDIRECTS} redirects — the site is probably in a redirect loop.`
+              : "The site redirected to a different host, which get_page_html does not follow. Check the site URL in the config (www vs bare domain), or the redirect rules on the site.");
+        }
+
+        const body = await readCapped(res!, MAX_PAGE_BYTES);
+        const html = body.text;
 
         const base = {
           url: target,
-          final_url: res.url,
-          status: res.status,
-          content_type: res.headers.get("content-type"),
-          bytes: html.length,
-          redirected: res.url !== target,
+          final_url: current.toString(),
+          status: res!.status,
+          content_type: res!.headers.get("content-type"),
+          bytes: body.bytes,
+          body_truncated_at_bytes: body.truncated ? MAX_PAGE_BYTES : undefined,
+          redirected: hops > 0,
         };
 
         if (mode === "html") return ok({ ...base, html: trimText(html, max_chars) });
@@ -256,8 +377,8 @@ export function siteConfigTools(ctx: ToolContext) {
       },
       handler: async ({ site_id, id, type, per_page }) => {
         const client = site(site_id);
-        const restBase = await client.restBaseForType(type);
-        const res = await client.get<any[]>(`/wp/v2/${restBase}/${id}/revisions`, { per_page, context: "edit" });
+        const route = await contentRoute(client, type);
+        const res = await client.get<any[]>(`${route}/${id}/revisions`, { per_page, context: "edit" });
         return ok({
           content_id: id, type, count: res.data.length,
           revisions: res.data.map((r: any) => ({
@@ -282,9 +403,9 @@ export function siteConfigTools(ctx: ToolContext) {
       handler: async ({ site_id, id, revision_id, type }) => {
         const client = site(site_id);
         client.assertWritable("restore_revision");
-        const restBase = await client.restBaseForType(type);
-        const revision = await client.get<any>(`/wp/v2/${restBase}/${id}/revisions/${revision_id}`, { context: "edit" });
-        const res = await client.post<any>(`/wp/v2/${restBase}/${id}`, {
+        const route = await contentRoute(client, type);
+        const revision = await client.get<any>(`${route}/${id}/revisions/${revision_id}`, { context: "edit" });
+        const res = await client.post<any>(`${route}/${id}`, {
           title: unwrap(revision.data.title),
           content: unwrap(revision.data.content),
           excerpt: unwrap(revision.data.excerpt),
@@ -300,7 +421,7 @@ export function siteConfigTools(ctx: ToolContext) {
       title: "Read custom fields",
       readOnly: true,
       description:
-        "Read the custom fields (post meta) on a content item, including keys that are not registered with show_in_rest and therefore invisible to get_content. Needs the companion plugin to see unregistered keys.",
+        "Read the custom fields (post meta) on a content item, including keys that are not registered with show_in_rest and therefore invisible to get_content. Needs the companion plugin to see unregistered keys. Values over 20,000 characters are truncated unless the key is requested by name in `keys`.",
       schema: {
         site_id: siteIdSchema,
         id: z.number().int().describe("Content ID."),
@@ -317,7 +438,7 @@ export function siteConfigTools(ctx: ToolContext) {
         const types = await client.postTypes();
         for (const t of Object.values<any>(types)) {
           try {
-            const res = await client.get<any>(`/wp/v2/${t.rest_base}/${id}`, { context: "edit" });
+            const res = await client.get<any>(`/${t.rest_namespace || "wp/v2"}/${t.rest_base}/${id}`, { context: "edit" });
             return ok({ content_id: id, source: "core REST (registered keys only)", meta: res.data.meta ?? {} },
               "Only meta registered with show_in_rest is visible. Install the companion plugin to read every key.");
           } catch { /* try the next type */ }
@@ -334,7 +455,7 @@ export function siteConfigTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         id: z.number().int().describe("Content ID."),
-        meta: z.record(z.any()).describe("Key/value pairs to write. A null value deletes the key."),
+        meta: z.record(z.string(), z.any()).describe("Key/value pairs to write. A null value deletes the key."),
       },
       handler: async ({ site_id, id, meta }) => {
         const client = site(site_id);
@@ -358,16 +479,18 @@ export function siteConfigTools(ctx: ToolContext) {
         site_id: siteIdSchema,
         route: z.string().describe("Route including its namespace, e.g. \"/wc/v3/orders\" or \"/wp/v2/posts/12\"."),
         method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional().default("GET").describe("HTTP method. Anything other than GET counts as a write and needs a writable site."),
-        query: z.record(z.any()).optional().describe("Query string parameters."),
-        body: z.record(z.any()).optional().describe("JSON request body for write methods."),
-        max_chars: z.number().int().optional().default(40000).describe("Truncate the response at this many characters."),
+        query: z.record(z.string(), z.any()).optional().describe("Query string parameters."),
+        body: z.record(z.string(), z.any()).optional().describe("JSON request body for write methods."),
+        max_chars: z.number().int().min(100).optional().default(40000).describe("Truncate the response at this many characters."),
       },
       handler: async ({ site_id, route, method, query, body, max_chars }) => {
         const client = site(site_id);
-        if (method !== "GET") client.assertWritable(`rest_api ${method} ${route}`);
+        const effective = effectiveRestMethod(method, route, query);
+        const writes = effective !== "GET" && effective !== "HEAD";
+        if (writes) client.assertWritable(`rest_api ${effective} ${route}`);
         const res = await client.request<any>(route, { method, query, body });
-        if (method !== "GET") {
-          audit({ site: client.site.id, tool: "rest_api", action: `${method} ${route}`, target: route, outcome: "ok" });
+        if (writes) {
+          audit({ site: client.site.id, tool: "rest_api", action: `${effective} ${route}`, target: route, outcome: "ok" });
         }
         // Truncate structurally, never by slicing the serialised JSON: cutting a
         // string mid-token produces something that cannot be parsed back.

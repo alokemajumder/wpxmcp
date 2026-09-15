@@ -58,6 +58,11 @@ Give wpxmcp the **least-privileged role that does the job**. WordPress enforces 
 
 **Content and media work needs only Editor.** Reach for Administrator when you genuinely need settings, plugins, themes, WP-CLI, SQL, theme files or the companion plugin.
 
+Two WordPress settings narrow even an Administrator, and the companion plugin honours both:
+
+- **Multisite.** A site administrator holds `manage_options`, but the plugin's routes reach network-wide data (SQL, plugin installs, theme files), so on a multisite network every one of them requires a **network super admin**.
+- **`DISALLOW_FILE_EDIT` / `DISALLOW_FILE_MODS`** in `wp-config.php` remove the capabilities for editing theme files and installing, updating or deleting plugins and themes. The plugin checks those capabilities rather than assuming an administrator has them, so theme-file writes and installs are refused with a message naming the constant.
+
 A practical pattern is a dedicated account — `ai-agent@example.com` with the Editor role — so its Application Passwords, capabilities and audit trail are separate from a human's.
 
 `test_site` reports which capabilities the authenticated user actually holds, so you can confirm rather than assume.

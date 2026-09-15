@@ -78,7 +78,13 @@ export function skillTools(_ctx: ToolContext) {
         content: z.string().describe("The playbook itself, in Markdown. Write it for an agent: concrete steps, exact tool names, and the mistakes to avoid."),
       },
       handler: async ({ name, title, description, keywords, content }) => {
-        const file = saveSkill(name, content, { title, description, keywords });
+        // Front matter is line-based: a newline in a header field would corrupt the file.
+        const oneLine = (v: string) => v.replace(/\s*[\r\n]+\s*/g, " ").trim();
+        const file = saveSkill(name, content, {
+          title: oneLine(title),
+          description: oneLine(description),
+          keywords: keywords?.map((k) => oneLine(k).replace(/,/g, " ")).filter(Boolean),
+        });
         return ok({ saved: true, name, file }, "Saved. load_skill will find it from now on, in this and every future session.");
       },
     }),

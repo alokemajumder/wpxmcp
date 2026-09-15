@@ -1,12 +1,13 @@
 import { z } from "zod";
 import { defineTool, ok, siteIdSchema, stripHtml, type ToolContext } from "../lib/tooling.js";
 import { audit } from "../lib/safety.js";
+import { decodeEntities, resolveTaxonomy, resolveTermIds, resolveType, routeFor } from "./content.js";
 
 function shapeTerm(term: any, taxonomy?: string) {
   return {
     id: term.id,
     taxonomy: term.taxonomy ?? taxonomy,
-    name: stripHtml(String(term.name ?? "")),
+    name: decodeEntities(String(term.name ?? "")),
     slug: term.slug,
     description: stripHtml(String(term.description ?? "")).slice(0, 500),
     parent: term.parent ?? 0,
@@ -34,11 +35,14 @@ export function taxonomyTools(ctx: ToolContext) {
       handler: async ({ site_id, for_type }) => {
         const client = site(site_id);
         const taxes = await client.taxonomies(true);
+        // Accept a REST base ("posts") as well as the type slug ("post").
+        const typeName = for_type ? ((await resolveType(client, for_type).catch(() => null))?.name ?? for_type) : undefined;
         const list = Object.entries<any>(taxes)
-          .filter(([, t]) => !for_type || (t.types ?? []).includes(for_type))
+          .filter(([, t]) => !typeName || (t.types ?? []).includes(typeName))
           .map(([name, t]) => ({
             taxonomy: name,
             rest_base: t.rest_base,
+            rest_namespace: t.rest_namespace && t.rest_namespace !== "wp/v2" ? t.rest_namespace : undefined,
             label: t.name,
             description: t.description || undefined,
             hierarchical: t.hierarchical,
@@ -70,8 +74,8 @@ export function taxonomyTools(ctx: ToolContext) {
       },
       handler: async (args) => {
         const client = site(args.site_id);
-        const restBase = await client.restBaseForTaxonomy(args.taxonomy);
-        const res = await client.get<any[]>(`/wp/v2/${restBase}`, {
+        const tax = await resolveTaxonomy(client, args.taxonomy);
+        const res = await client.get<any[]>(tax.route, {
           search: args.search,
           slug: args.slug,
           parent: args.parent,
@@ -84,12 +88,12 @@ export function taxonomyTools(ctx: ToolContext) {
         });
         return ok({
           site: client.site.id,
-          taxonomy: args.taxonomy,
-          rest_base: restBase,
+          taxonomy: tax.name,
+          rest_base: tax.restBase,
           total: res.total ?? res.data.length,
           total_pages: res.totalPages ?? 1,
           page: args.page,
-          terms: res.data.map((t) => shapeTerm(t, args.taxonomy)),
+          terms: res.data.map((t) => shapeTerm(t, tax.name)),
         });
       },
     }),
@@ -106,9 +110,9 @@ export function taxonomyTools(ctx: ToolContext) {
       },
       handler: async ({ site_id, taxonomy, id }) => {
         const client = site(site_id);
-        const restBase = await client.restBaseForTaxonomy(taxonomy);
-        const res = await client.get<any>(`/wp/v2/${restBase}/${id}`, client.hasCredentials() ? { context: "edit" } : {});
-        return ok(shapeTerm(res.data, taxonomy));
+        const tax = await resolveTaxonomy(client, taxonomy);
+        const res = await client.get<any>(`${tax.route}/${id}`, client.hasCredentials() ? { context: "edit" } : {});
+        return ok(shapeTerm(res.data, tax.name));
       },
     }),
 
@@ -123,17 +127,29 @@ export function taxonomyTools(ctx: ToolContext) {
         slug: z.string().optional().describe("URL slug. Derived from the name if omitted."),
         description: z.string().optional().describe("Longer descriptive text."),
         parent: z.number().int().optional().describe("Parent term ID. Hierarchical taxonomies only — passing this on a flat taxonomy such as tags is an error."),
-        meta: z.record(z.any()).optional().describe("Term meta, for keys registered with show_in_rest."),
+        meta: z.record(z.string(), z.any()).optional().describe("Term meta, for keys registered with show_in_rest."),
       },
       handler: async ({ site_id, taxonomy, ...rest }) => {
         const client = site(site_id);
         client.assertWritable("create_term");
-        const restBase = await client.restBaseForTaxonomy(taxonomy);
+        const tax = await resolveTaxonomy(client, taxonomy);
+        if (rest.parent && tax.info && !tax.info.hierarchical) {
+          throw new Error(`"${tax.name}" is not hierarchical, so terms in it cannot have a parent. Drop \`parent\`.`);
+        }
         const body: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(rest)) if (v !== undefined) body[k] = v;
-        const res = await client.post<any>(`/wp/v2/${restBase}`, body);
-        audit({ site: client.site.id, tool: "create_term", action: `create ${taxonomy}`, target: res.data.id, outcome: "ok", detail: String(rest.name) });
-        return ok({ created: true, ...shapeTerm(res.data, taxonomy) });
+        let res;
+        try {
+          res = await client.post<any>(tax.route, body);
+        } catch (e: any) {
+          const existing = e?.code === "term_exists" ? e?.body?.data?.term_id : undefined;
+          if (existing) {
+            throw new Error(`A ${tax.name} term with that name already exists (id ${existing}${rest.parent ? " under the same parent" : ""}). Use it via get_term / assign_terms_to_content, or pick a different name or slug.`);
+          }
+          throw e;
+        }
+        audit({ site: client.site.id, tool: "create_term", action: `create ${tax.name}`, target: res.data.id, outcome: "ok", detail: String(rest.name) });
+        return ok({ created: true, ...shapeTerm(res.data, tax.name) });
       },
     }),
 
@@ -148,19 +164,20 @@ export function taxonomyTools(ctx: ToolContext) {
         name: z.string().optional().describe("Display name."),
         slug: z.string().optional().describe("URL slug."),
         description: z.string().optional().describe("Longer descriptive text."),
-        parent: z.number().int().optional().describe("Parent ID, or 0 for none."),
-        meta: z.record(z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
+        parent: z.number().int().min(0).optional().describe("Parent term ID, or 0 for none. Hierarchical taxonomies only."),
+        meta: z.record(z.string(), z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
       },
       handler: async ({ site_id, taxonomy, id, ...rest }) => {
         const client = site(site_id);
         client.assertWritable("update_term");
-        const restBase = await client.restBaseForTaxonomy(taxonomy);
+        const tax = await resolveTaxonomy(client, taxonomy);
         const body: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(rest)) if (v !== undefined) body[k] = v;
         if (Object.keys(body).length === 0) throw new Error("No fields to update were supplied.");
-        const res = await client.post<any>(`/wp/v2/${restBase}/${id}`, body);
-        audit({ site: client.site.id, tool: "update_term", action: `update ${taxonomy}`, target: id, outcome: "ok", detail: Object.keys(body).join(",") });
-        return ok({ updated: true, changed_fields: Object.keys(body), ...shapeTerm(res.data, taxonomy) });
+        if (body.parent === id) throw new Error("A term cannot be its own parent.");
+        const res = await client.post<any>(`${tax.route}/${id}`, body);
+        audit({ site: client.site.id, tool: "update_term", action: `update ${tax.name}`, target: id, outcome: "ok", detail: Object.keys(body).join(",") });
+        return ok({ updated: true, changed_fields: Object.keys(body), ...shapeTerm(res.data, tax.name) });
       },
     }),
 
@@ -179,24 +196,27 @@ export function taxonomyTools(ctx: ToolContext) {
       handler: async ({ site_id, taxonomy, id, confirm }) => {
         const client = site(site_id);
         client.assertWritable("delete_term");
-        const restBase = await client.restBaseForTaxonomy(taxonomy);
+        const tax = await resolveTaxonomy(client, taxonomy);
 
         if (!confirm) {
-          const current = await client.get<any>(`/wp/v2/${restBase}/${id}`);
-          const children = await client.get<any[]>(`/wp/v2/${restBase}`, { parent: id, per_page: 100 }).catch(() => ({ data: [] as any[] }));
+          const current = await client.get<any>(`${tax.route}/${id}`);
+          // `parent` is only a valid filter on hierarchical taxonomies; flat ones have no children.
+          const children = tax.info?.hierarchical === false
+            ? { data: [] as any[] }
+            : await client.get<any[]>(tax.route, { parent: id, per_page: 100 }).catch(() => ({ data: [] as any[] }));
           audit({ site: client.site.id, tool: "delete_term", action: "delete", target: id, outcome: "refused", detail: "confirm not set" });
           return ok({
             deleted: false,
             requires_confirmation: true,
-            term: shapeTerm(current.data, taxonomy),
+            term: shapeTerm(current.data, tax.name),
             assigned_items: current.data.count,
-            child_terms: children.data.map((c: any) => ({ id: c.id, name: c.name })),
-          }, `Terms cannot be recovered once deleted, so nothing was removed. This term is on ${current.data.count} item(s)${children.data.length ? ` and has ${children.data.length} child term(s), which will be re-parented` : ""}. Re-run with confirm: true to delete it.`);
+            child_terms: children.data.map((c: any) => ({ id: c.id, name: decodeEntities(String(c.name ?? "")) })),
+          }, `Terms cannot be recovered once deleted, so nothing was removed. This term is on ${current.data.count} item(s)${children.data.length ? ` and has ${children.data.length} child term(s), which will move up to this term's parent` : ""}. Re-run with confirm: true to delete it.`);
         }
 
-        const res = await client.del<any>(`/wp/v2/${restBase}/${id}`, { force: true });
+        const res = await client.del<any>(`${tax.route}/${id}`, { force: true });
         audit({ site: client.site.id, tool: "delete_term", action: "delete", target: id, outcome: "ok" });
-        return ok({ deleted: true, term: shapeTerm(res.data?.previous ?? { id }, taxonomy) });
+        return ok({ deleted: true, term: shapeTerm(res.data?.previous ?? { id }, tax.name) });
       },
     }),
 
@@ -218,37 +238,37 @@ export function taxonomyTools(ctx: ToolContext) {
       handler: async ({ site_id, content_id, type, taxonomy, terms, mode, create_missing }) => {
         const client = site(site_id);
         client.assertWritable("assign_terms_to_content");
-        const typeBase = await client.restBaseForType(type);
-        const taxBase = await client.restBaseForTaxonomy(taxonomy);
+        const typeInfo = await resolveType(client, type);
+        const tax = await resolveTaxonomy(client, taxonomy);
+        const taxBase = tax.restBase;
 
-        const resolved: number[] = [];
-        const created: any[] = [];
-        for (const value of terms) {
-          if (typeof value === "number") { resolved.push(value); continue; }
-          const search = await client.get<any[]>(`/wp/v2/${taxBase}`, { search: value, per_page: 20 });
-          const exact = search.data.find((t: any) => t.name.toLowerCase() === value.toLowerCase() || t.slug === value);
-          if (exact) { resolved.push(exact.id); continue; }
-          if (!create_missing) throw new Error(`No term named "${value}" in ${taxonomy}, and create_missing is false.`);
-          const made = await client.post<any>(`/wp/v2/${taxBase}`, { name: value });
-          resolved.push(made.data.id);
-          created.push({ id: made.data.id, name: made.data.name });
+        // Read the item first: a taxonomy not attached to the type is silently
+        // ignored by WordPress, so catch it before creating any terms.
+        const currentRes = await client.get<any>(`${typeInfo.route}/${content_id}`, { context: "edit" });
+        if (!Array.isArray(currentRes.data?.[taxBase])) {
+          throw new Error(`${typeInfo.name} ${content_id} has no "${taxBase}" field — the ${tax.name} taxonomy is not attached to the "${typeInfo.name}" type (or is not exposed over REST), so nothing was changed. Run discover_taxonomies with for_type: "${typeInfo.name}".`);
         }
+        const existing: number[] = currentRes.data[taxBase];
 
-        const currentRes = await client.get<any>(`/wp/v2/${typeBase}/${content_id}`, client.hasCredentials() ? { context: "edit" } : {});
-        const existing: number[] = currentRes.data[taxBase] ?? [];
+        // Removing never creates: a name that does not exist is simply not attached.
+        const { ids: resolved, created, missing } = await resolveTermIds(client, tax, terms, mode !== "remove" && create_missing);
+        if (missing.length && mode !== "remove") {
+          throw new Error(`No ${tax.name} term named ${missing.map((m) => `"${m}"`).join(", ")}, and create_missing is false. Nothing was changed.`);
+        }
 
         let next: number[];
         if (mode === "add") next = [...new Set([...existing, ...resolved])];
         else if (mode === "remove") next = existing.filter((id) => !resolved.includes(id));
         else next = [...new Set(resolved)];
 
-        const res = await client.post<any>(`/wp/v2/${typeBase}/${content_id}`, { [taxBase]: next });
-        audit({ site: client.site.id, tool: "assign_terms_to_content", action: `${mode} ${taxonomy}`, target: content_id, outcome: "ok", detail: next.join(",") });
+        const res = await client.post<any>(`${typeInfo.route}/${content_id}`, { [taxBase]: next });
+        audit({ site: client.site.id, tool: "assign_terms_to_content", action: `${mode} ${tax.name}`, target: content_id, outcome: "ok", detail: next.join(",") });
 
         return ok({
-          updated: true, content_id, type, taxonomy, mode,
+          updated: true, content_id, type: typeInfo.name, taxonomy: tax.name, mode,
           before: existing, after: res.data[taxBase] ?? next,
           created_terms: created.length ? created : undefined,
+          not_found: missing.length ? missing : undefined,
         });
       },
     }),
@@ -265,19 +285,25 @@ export function taxonomyTools(ctx: ToolContext) {
       },
       handler: async ({ site_id, content_id, type }) => {
         const client = site(site_id);
-        const typeBase = await client.restBaseForType(type);
-        const item = await client.get<any>(`/wp/v2/${typeBase}/${content_id}`, client.hasCredentials() ? { context: "edit" } : {});
+        const typeInfo = await resolveType(client, type);
+        const item = await client.get<any>(`${typeInfo.route}/${content_id}`, client.hasCredentials() ? { context: "edit" } : {});
         const taxes = await client.taxonomies();
 
         const grouped: Record<string, any[]> = {};
         for (const [taxName, tax] of Object.entries<any>(taxes)) {
-          if (!(tax.types ?? []).includes(type)) continue;
+          if (!(tax.types ?? []).includes(typeInfo.name)) continue;
           const ids: number[] = item.data[tax.rest_base] ?? [];
           if (!Array.isArray(ids) || ids.length === 0) { grouped[taxName] = []; continue; }
-          const res = await client.get<any[]>(`/wp/v2/${tax.rest_base}`, { include: ids, per_page: 100 });
-          grouped[taxName] = res.data.map((t) => shapeTerm(t, taxName));
+          const route = routeFor(tax.rest_namespace, tax.rest_base);
+          const found: any[] = [];
+          // `include` is capped by per_page, so page through large assignments.
+          for (let i = 0; i < ids.length; i += 100) {
+            const res = await client.get<any[]>(route, { include: ids.slice(i, i + 100), per_page: 100 });
+            found.push(...(res.data ?? []));
+          }
+          grouped[taxName] = found.map((t) => shapeTerm(t, taxName));
         }
-        return ok({ content_id, type, title: stripHtml(item.data.title?.rendered ?? item.data.title?.raw ?? ""), terms: grouped });
+        return ok({ content_id, type: typeInfo.name, title: stripHtml(item.data.title?.rendered ?? item.data.title?.raw ?? ""), terms: grouped });
       },
     }),
   ];

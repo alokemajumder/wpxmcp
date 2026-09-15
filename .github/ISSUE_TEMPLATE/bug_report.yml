@@ -44,10 +44,19 @@ body:
       required: true
 
   - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: Which client, and the protocol revision if you know it (2026-07-28 or a 2025-era revision).
+      placeholder: "Claude Code, 2026-07-28"
+    validations:
+      required: false
+
+  - type: input
     id: versions
     attributes:
       label: Versions
-      placeholder: "wpxmcp 1.0.0, WordPress 6.7, PHP 8.2, Node 24"
+      placeholder: "wpxmcp 2.0.0, companion plugin 2.0.0, WordPress 6.7, PHP 8.2, Node 24"
     validations:
       required: true
 

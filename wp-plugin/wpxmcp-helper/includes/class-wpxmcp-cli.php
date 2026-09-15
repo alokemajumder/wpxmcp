@@ -131,9 +131,9 @@ class WPXMCP_CLI {
 			// a client error, not a server fault. Preserve any status already set.
 			$data = $result->get_error_data();
 			if ( ! is_array( $data ) || ! isset( $data['status'] ) ) {
-				$client_errors = array( 'wpxmcp_protected_option', 'wpxmcp_missing_arg', 'wpxmcp_not_found', 'wpxmcp_plugin_active', 'wpxmcp_empty_search' );
+				$client_errors = array( 'wpxmcp_protected_option', 'wpxmcp_missing_arg', 'wpxmcp_not_found', 'wpxmcp_plugin_active', 'wpxmcp_empty_search', 'wpxmcp_forbidden', 'wpxmcp_broken_theme' );
 				$status        = in_array( $result->get_error_code(), $client_errors, true ) ? 400 : 500;
-				if ( 'wpxmcp_protected_option' === $result->get_error_code() ) {
+				if ( in_array( $result->get_error_code(), array( 'wpxmcp_protected_option', 'wpxmcp_forbidden' ), true ) ) {
 					$status = 403;
 				}
 				$result->add_data( array( 'status' => $status ), $result->get_error_code() );
@@ -321,8 +321,28 @@ class WPXMCP_CLI {
 		if ( empty( $args[0] ) ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Supply the hook name to run.' );
 		}
-		do_action( $args[0] );
-		return array( 'success' => true, 'hook' => $args[0] );
+
+		// Like WP-CLI, run only scheduled events, each with the arguments it was
+		// scheduled with — firing an arbitrary action with none is not a cron run
+		// and fatals callbacks that expect their arguments.
+		$ran = 0;
+		foreach ( (array) _get_cron_array() as $timestamp => $hooks ) {
+			if ( empty( $hooks[ $args[0] ] ) ) {
+				continue;
+			}
+			foreach ( $hooks[ $args[0] ] as $event ) {
+				$event_args = isset( $event['args'] ) ? (array) $event['args'] : array();
+				do_action_ref_array( $args[0], $event_args );
+				$ran++;
+			}
+		}
+
+		if ( 0 === $ran ) {
+			return new WP_Error( 'wpxmcp_not_found', sprintf( 'No scheduled cron event with the hook "%s". See cron event list.', $args[0] ) );
+		}
+
+		wpxmcp_audit( 'cli cron event run', array( 'hook' => $args[0], 'events' => $ran ) );
+		return array( 'success' => true, 'hook' => $args[0], 'events_run' => $ran );
 	}
 
 	/** @return array */
@@ -370,7 +390,7 @@ class WPXMCP_CLI {
 	public static function cmd_option_list( $args, $flags ) {
 		global $wpdb;
 		$search = isset( $flags['search'] ) ? (string) $flags['search'] : '';
-		$limit  = isset( $flags['limit'] ) ? (int) $flags['limit'] : 100;
+		$limit  = isset( $flags['limit'] ) ? min( 1000, max( 1, (int) $flags['limit'] ) ) : 100;
 
 		if ( $search ) {
 			$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB
@@ -395,9 +415,8 @@ class WPXMCP_CLI {
 		if ( count( $args ) < 2 ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Usage: option update <name> <value>' );
 		}
-		$blocked = array( 'siteurl', 'home', 'active_plugins', 'template', 'stylesheet' );
-		if ( in_array( $args[0], $blocked, true ) ) {
-			return new WP_Error( 'wpxmcp_protected_option', sprintf( '"%s" is protected — writing it can lock you out of the site.', $args[0] ) );
+		if ( wpxmcp_is_protected_option( $args[0] ) ) {
+			return new WP_Error( 'wpxmcp_protected_option', sprintf( '"%s" is protected — writing it can lock you out of the site or bypass wpxmcp\'s safeguards.', $args[0] ) );
 		}
 		$previous = get_option( $args[0] );
 		update_option( $args[0], $args[1] );
@@ -412,6 +431,9 @@ class WPXMCP_CLI {
 	public static function cmd_option_delete( $args ) {
 		if ( empty( $args[0] ) ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Supply the option name.' );
+		}
+		if ( wpxmcp_is_protected_option( $args[0] ) ) {
+			return new WP_Error( 'wpxmcp_protected_option', sprintf( '"%s" is protected — deleting it can lock you out of the site or bypass wpxmcp\'s safeguards.', $args[0] ) );
 		}
 		$deleted = delete_option( $args[0] );
 		wpxmcp_audit( 'cli option delete', array( 'name' => $args[0] ) );
@@ -477,6 +499,9 @@ class WPXMCP_CLI {
 		if ( ! function_exists( 'activate_plugin' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		}
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			return self::forbidden( 'activate_plugins' );
+		}
 		$file = self::resolve_plugin_file( $args[0] ?? '' );
 		if ( is_wp_error( $file ) ) {
 			return $file;
@@ -496,6 +521,9 @@ class WPXMCP_CLI {
 	public static function cmd_plugin_deactivate( $args ) {
 		if ( ! function_exists( 'deactivate_plugins' ) ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		if ( ! current_user_can( 'activate_plugins' ) ) {
+			return self::forbidden( 'activate_plugins' );
 		}
 		$file = self::resolve_plugin_file( $args[0] ?? '' );
 		if ( is_wp_error( $file ) ) {
@@ -520,8 +548,13 @@ class WPXMCP_CLI {
 			return $result;
 		}
 		if ( ! empty( $flags['activate'] ) ) {
-			self::cmd_plugin_activate( array( $args[0] ) );
-			$result['activated'] = true;
+			$activated = self::cmd_plugin_activate( array( $args[0] ) );
+			if ( is_wp_error( $activated ) ) {
+				$result['activated']        = false;
+				$result['activation_error'] = $activated->get_error_message();
+			} else {
+				$result['activated'] = true;
+			}
 		}
 		return $result;
 	}
@@ -534,6 +567,10 @@ class WPXMCP_CLI {
 		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 		require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		require_once ABSPATH . 'wp-admin/includes/update.php';
+
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			return self::forbidden( 'update_plugins' );
+		}
 
 		$file = self::resolve_plugin_file( $args[0] ?? '' );
 		if ( is_wp_error( $file ) ) {
@@ -559,6 +596,10 @@ class WPXMCP_CLI {
 		require_once ABSPATH . 'wp-admin/includes/plugin.php';
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 
+		if ( ! current_user_can( 'delete_plugins' ) ) {
+			return self::forbidden( 'delete_plugins' );
+		}
+
 		$file = self::resolve_plugin_file( $args[0] ?? '' );
 		if ( is_wp_error( $file ) ) {
 			return $file;
@@ -583,7 +624,7 @@ class WPXMCP_CLI {
 		$query = new WP_Query( array(
 			'post_type'      => isset( $flags['post_type'] ) ? explode( ',', (string) $flags['post_type'] ) : 'post',
 			'post_status'    => isset( $flags['post_status'] ) ? explode( ',', (string) $flags['post_status'] ) : 'any',
-			'posts_per_page' => isset( $flags['posts_per_page'] ) ? (int) $flags['posts_per_page'] : 20,
+			'posts_per_page' => isset( $flags['posts_per_page'] ) ? min( 500, max( 1, (int) $flags['posts_per_page'] ) ) : 20,
 			's'              => isset( $flags['s'] ) ? (string) $flags['s'] : '',
 			'no_found_rows'  => true,
 		) );
@@ -639,7 +680,7 @@ class WPXMCP_CLI {
 		if ( count( $args ) < 3 ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Usage: post meta update <id> <key> <value>' );
 		}
-		update_post_meta( (int) $args[0], $args[1], $args[2] );
+		update_post_meta( (int) $args[0], $args[1], wp_slash( $args[2] ) );
 		wpxmcp_audit( 'cli post meta update', array( 'post_id' => (int) $args[0], 'key' => $args[1] ) );
 		return array( 'success' => true, 'post_id' => (int) $args[0], 'key' => $args[1] );
 	}
@@ -653,6 +694,7 @@ class WPXMCP_CLI {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Usage: post meta delete <id> <key>' );
 		}
 		delete_post_meta( (int) $args[0], $args[1] );
+		wpxmcp_audit( 'cli post meta delete', array( 'post_id' => (int) $args[0], 'key' => $args[1] ) );
 		return array( 'success' => true, 'post_id' => (int) $args[0], 'key' => $args[1] );
 	}
 
@@ -707,30 +749,52 @@ class WPXMCP_CLI {
 			return new WP_Error( 'wpxmcp_empty_search', 'The search string cannot be empty.' );
 		}
 
+		// Dry run first, enforced here rather than trusted to the client: a real
+		// replace needs a dry run of the same arguments by the same user within
+		// the last ten minutes, and consumes it.
+		$preview_key = 'wpxmcp_sr_' . md5( get_current_user_id() . "\0" . $old . "\0" . $new );
+		if ( ! $dry_run ) {
+			if ( ! get_transient( $preview_key ) ) {
+				return new WP_Error(
+					'wpxmcp_dry_run_required',
+					'Run this search-replace with --dry-run first and review the report; the real run is accepted for ten minutes afterwards.',
+					array( 'status' => 409 )
+				);
+			}
+			delete_transient( $preview_key );
+		}
+
 		// Restricted to the tables where content actually lives; core structural
 		// tables are excluded so a replace cannot corrupt the install.
+		// The plugin's own options (snippets, audit log) are excluded: rewriting
+		// an active snippet's code here would run it without wp-admin review.
 		$targets = array(
-			$wpdb->posts    => array( 'ID', array( 'post_content', 'post_title', 'post_excerpt' ) ),
-			$wpdb->postmeta => array( 'meta_id', array( 'meta_value' ) ),
-			$wpdb->options  => array( 'option_id', array( 'option_value' ) ),
-			$wpdb->comments => array( 'comment_ID', array( 'comment_content' ) ),
-			$wpdb->terms    => array( 'term_id', array( 'name' ) ),
+			$wpdb->posts    => array( 'ID', array( 'post_content', 'post_title', 'post_excerpt' ), '' ),
+			$wpdb->postmeta => array( 'meta_id', array( 'meta_value' ), '' ),
+			$wpdb->options  => array( 'option_id', array( 'option_value' ), " AND option_name NOT LIKE 'wpxmcp\\_%'" ),
+			$wpdb->comments => array( 'comment_ID', array( 'comment_content' ), '' ),
+			$wpdb->terms    => array( 'term_id', array( 'name' ), '' ),
 		);
 
-		$report  = array();
-		$changed = 0;
+		$report    = array();
+		$changed   = 0;
+		$truncated = array();
+		$skipped   = 0;
 
 		foreach ( $targets as $table => $spec ) {
-			list( $pk, $columns ) = $spec;
+			list( $pk, $columns, $extra_where ) = $spec;
 
 			foreach ( $columns as $column ) {
 				$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB
-					"SELECT `$pk` AS pk, `$column` AS val FROM `$table` WHERE `$column` LIKE %s LIMIT 5000",
+					"SELECT `$pk` AS pk, `$column` AS val FROM `$table` WHERE `$column` LIKE %s",
 					'%' . $wpdb->esc_like( $old ) . '%'
-				), ARRAY_A );
+				) . $extra_where . ' LIMIT 5000', ARRAY_A );
 
 				if ( empty( $rows ) ) {
 					continue;
+				}
+				if ( count( $rows ) >= 5000 ) {
+					$truncated[] = $table . '.' . $column;
 				}
 
 				$count   = 0;
@@ -742,9 +806,14 @@ class WPXMCP_CLI {
 					// Serialised data must be replaced structurally, never by string
 					// substitution, or the length prefixes break and the value is lost.
 					if ( is_serialized( $value ) ) {
-						$unserialized = maybe_unserialize( $value );
-						$replaced     = self::deep_replace( $unserialized, $old, $new );
-						$new_value    = maybe_serialize( $replaced );
+						$unserialized = @unserialize( trim( $value ) ); // phpcs:ignore
+						if ( false === $unserialized && 'b:0;' !== trim( $value ) ) {
+							// Corrupt serialisation: re-serialising false would destroy it.
+							$skipped++;
+							continue;
+						}
+						$replaced  = self::deep_replace( $unserialized, $old, $new );
+						$new_value = maybe_serialize( $replaced );
 					} else {
 						$new_value = str_replace( $old, $new, $value );
 					}
@@ -779,7 +848,9 @@ class WPXMCP_CLI {
 			}
 		}
 
-		if ( ! $dry_run ) {
+		if ( $dry_run ) {
+			set_transient( $preview_key, 1, 10 * MINUTE_IN_SECONDS );
+		} else {
 			wp_cache_flush();
 			wpxmcp_audit( 'cli search-replace', array( 'old' => $old, 'new' => $new, 'rows' => $changed ) );
 		}
@@ -790,6 +861,8 @@ class WPXMCP_CLI {
 			'replace'       => $new,
 			'rows_affected' => $changed,
 			'report'        => $report,
+			'skipped_corrupt_serialized' => $skipped,
+			'incomplete'    => empty( $truncated ) ? null : 'More than 5000 matching rows in ' . implode( ', ', $truncated ) . ' — only the first 5000 were processed. Dry-run and apply again to continue.',
 			'note'          => $dry_run
 				? 'Dry run — nothing was written. Serialised values are handled structurally, so lengths stay correct.'
 				: 'Applied, and the object cache was flushed. Page caches from caching plugins are separate.',
@@ -814,6 +887,10 @@ class WPXMCP_CLI {
 				$out[ $key ] = self::deep_replace( $value, $old, $new );
 			}
 			return $out;
+		}
+		if ( $data instanceof __PHP_Incomplete_Class ) {
+			// Its class is not loaded, so its properties cannot be written back.
+			return $data;
 		}
 		if ( is_object( $data ) ) {
 			$clone = clone $data;
@@ -882,6 +959,12 @@ class WPXMCP_CLI {
 		if ( ! $theme->exists() ) {
 			return new WP_Error( 'wpxmcp_not_found', sprintf( 'No theme "%s" is installed.', $args[0] ) );
 		}
+		if ( ! current_user_can( 'switch_themes' ) ) {
+			return self::forbidden( 'switch_themes' );
+		}
+		if ( $theme->errors() ) {
+			return new WP_Error( 'wpxmcp_broken_theme', 'That theme reports errors and cannot be activated: ' . $theme->errors()->get_error_message() );
+		}
 		switch_theme( $theme->get_stylesheet() );
 		wpxmcp_audit( 'cli theme activate', array( 'theme' => $args[0] ) );
 		return array( 'success' => true, 'active_theme' => get_stylesheet() );
@@ -909,11 +992,18 @@ class WPXMCP_CLI {
 		if ( empty( $args[0] ) ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Supply the theme stylesheet.' );
 		}
+		if ( ! current_user_can( 'update_themes' ) ) {
+			return self::forbidden( 'update_themes' );
+		}
 		wp_update_themes();
 		$upgrader = new Theme_Upgrader( new WP_Ajax_Upgrader_Skin() );
 		$result   = $upgrader->upgrade( $args[0] );
 
-		return is_wp_error( $result ) ? $result : array( 'success' => (bool) $result, 'theme' => $args[0] );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+		wpxmcp_audit( 'cli theme update', array( 'theme' => $args[0] ) );
+		return array( 'success' => (bool) $result, 'theme' => $args[0] );
 	}
 
 	/** @return array */
@@ -942,6 +1032,7 @@ class WPXMCP_CLI {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Usage: theme mod set <key> <value>' );
 		}
 		set_theme_mod( $args[0], $args[1] );
+		wpxmcp_audit( 'cli theme mod set', array( 'key' => $args[0] ) );
 		return array( 'success' => true, 'key' => $args[0], 'value' => get_theme_mod( $args[0] ) );
 	}
 
@@ -953,6 +1044,7 @@ class WPXMCP_CLI {
 		if ( empty( $args[0] ) ) {
 			return array( 'success' => false, 'message' => 'Supply the transient name.' );
 		}
+		wpxmcp_audit( 'cli transient delete', array( 'name' => $args[0] ) );
 		return array( 'success' => delete_transient( $args[0] ), 'name' => $args[0] );
 	}
 
@@ -971,7 +1063,7 @@ class WPXMCP_CLI {
 	 */
 	public static function cmd_user_list( $args, $flags ) {
 		$users = get_users( array(
-			'number' => isset( $flags['number'] ) ? (int) $flags['number'] : 50,
+			'number' => isset( $flags['number'] ) ? min( 500, max( 1, (int) $flags['number'] ) ) : 50,
 			'role'   => isset( $flags['role'] ) ? (string) $flags['role'] : '',
 		) );
 		$out = array();
@@ -1027,7 +1119,8 @@ class WPXMCP_CLI {
 		if ( is_wp_error( $user ) ) {
 			return $user;
 		}
-		update_user_meta( $user->ID, $args[1], $args[2] );
+		update_user_meta( $user->ID, $args[1], wp_slash( $args[2] ) );
+		wpxmcp_audit( 'cli user meta update', array( 'user' => $user->ID, 'key' => $args[1] ) );
 		return array( 'success' => true, 'user_id' => $user->ID, 'key' => $args[1] );
 	}
 
@@ -1043,6 +1136,9 @@ class WPXMCP_CLI {
 		if ( empty( $args[1] ) ) {
 			return new WP_Error( 'wpxmcp_missing_arg', 'Supply the role to add.' );
 		}
+		if ( ! get_role( $args[1] ) ) {
+			return new WP_Error( 'wpxmcp_not_found', sprintf( 'No role "%s" exists. See role list.', $args[1] ) );
+		}
 		$user->add_role( $args[1] );
 		wpxmcp_audit( 'cli user add-role', array( 'user' => $user->ID, 'role' => $args[1] ) );
 		return array( 'success' => true, 'user_id' => $user->ID, 'roles' => $user->roles );
@@ -1057,7 +1153,11 @@ class WPXMCP_CLI {
 		if ( is_wp_error( $user ) ) {
 			return $user;
 		}
-		$user->remove_role( $args[1] ?? '' );
+		if ( empty( $args[1] ) ) {
+			return new WP_Error( 'wpxmcp_missing_arg', 'Supply the role to remove.' );
+		}
+		$user->remove_role( $args[1] );
+		wpxmcp_audit( 'cli user remove-role', array( 'user' => $user->ID, 'role' => $args[1] ) );
 		return array( 'success' => true, 'user_id' => $user->ID, 'roles' => $user->roles );
 	}
 
@@ -1142,13 +1242,14 @@ class WPXMCP_CLI {
 	public static function cmd_maintenance_activate() {
 		file_put_contents( ABSPATH . '.maintenance', '<?php $upgrading = ' . time() . '; ?>' ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		wpxmcp_audit( 'cli maintenance-mode activate' );
-		return array( 'success' => true, 'active' => true, 'warning' => 'The site now shows a maintenance page to every visitor.' );
+		return array( 'success' => true, 'active' => true, 'warning' => 'The site now shows a maintenance page to every visitor — including REST requests, so this connection cannot turn it off. WordPress lifts it automatically after 10 minutes; to end it sooner, delete .maintenance from the WordPress root.' );
 	}
 
 	/** @return array */
 	public static function cmd_maintenance_deactivate() {
 		if ( file_exists( ABSPATH . '.maintenance' ) ) {
 			wp_delete_file( ABSPATH . '.maintenance' );
+			wpxmcp_audit( 'cli maintenance-mode deactivate' );
 		}
 		return array( 'success' => true, 'active' => false );
 	}
@@ -1156,6 +1257,20 @@ class WPXMCP_CLI {
 	/* ------------------------------------------------------------------ *
 	 * Helpers
 	 * ------------------------------------------------------------------ */
+
+	/**
+	 * A refusal for a capability WordPress withholds (DISALLOW_FILE_MODS, or a
+	 * multisite role without it).
+	 *
+	 * @param string $cap Capability.
+	 * @return WP_Error
+	 */
+	private static function forbidden( $cap ) {
+		return new WP_Error(
+			'wpxmcp_forbidden',
+			sprintf( 'WordPress does not grant the "%s" capability to this user here — usually because DISALLOW_FILE_MODS is set in wp-config.php.', $cap )
+		);
+	}
 
 	/**
 	 * Accepts a slug or a full plugin file and returns the plugin file.
@@ -1206,6 +1321,13 @@ class WPXMCP_CLI {
 		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/misc.php';
+		// Plugin_Upgrader calls wp_clean_plugins_cache() and get_plugins(), which a
+		// REST request has not loaded.
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+		if ( ! current_user_can( 'plugin' === $kind ? 'install_plugins' : 'install_themes' ) ) {
+			return self::forbidden( 'plugin' === $kind ? 'install_plugins' : 'install_themes' );
+		}
 
 		if ( 'plugin' === $kind ) {
 			require_once ABSPATH . 'wp-admin/includes/plugin-install.php';

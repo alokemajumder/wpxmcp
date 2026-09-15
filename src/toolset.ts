@@ -13,41 +13,51 @@ import { siteConfigTools } from "./tools/site.js";
 import { powerTools } from "./tools/power.js";
 import { bulkTools } from "./tools/bulk.js";
 import { skillTools } from "./tools/skills.js";
+import { opsTools } from "./tools/ops.js";
+import { devTools } from "./tools/devtools.js";
+import { profilerTools } from "./tools/profiler.js";
+import { themeDevTools } from "./tools/themedev.js";
+import { growthTools } from "./tools/growth.js";
+import { pluginControlTools } from "./tools/plugin-control.js";
 
-export const VERSION = "1.0.0";
+export const VERSION = "2.0.0";
 
 export const INSTRUCTIONS = `wpxmcp manages self-hosted WordPress sites over the REST API.
 
 Start of every substantive task:
-  1. load_skill with a description of what you are about to do. Playbooks cover Gutenberg
-     markup, classic themes, page builders, SEO audits, editable fields and troubleshooting.
-     Page-builder content (Elementor, Divi, Beaver Builder, Bricks, Breakdance) is stored in
-     builder-specific meta — editing it as ordinary HTML corrupts the layout, so load that
-     skill before touching such a post.
-  2. With several sites configured, pass site_id. list_sites shows the ids; with one site it
-     is optional.
+  1. load_skill with a description of what you are about to do. Playbooks cover publishing,
+     Gutenberg markup, page builders, themes and design, theme.json, SEO, accessibility,
+     WooCommerce, plugin settings, launch and migration, site-down incidents, troubleshooting,
+     security, performance, developer introspection and fleet maintenance. Page-builder content
+     (Elementor, Divi, Beaver Builder, Bricks, Breakdance) lives in builder-specific storage —
+     editing it as ordinary HTML corrupts the layout, so load that skill before touching it.
+  2. With several sites configured, pass site_id. list_sites shows the ids.
 
 Finding things:
-  - find_content_by_url resolves any front-end URL to the content behind it, detecting custom
-    post types from the URL shape. Reach for it whenever a human hands you a link.
+  - find_content_by_url resolves any front-end URL to the content behind it. Use it whenever
+    a person hands you a link.
   - discover_content_types / discover_taxonomies before assuming a type exists.
   - discover_rest_routes before calling rest_api. Never invent a route.
+  - inspect_plugin shows how to control an installed plugin: its REST routes, abilities,
+    settings and admin screens.
 
 Editing:
-  - Read content before editing it. update_content's \`edits\` applies targeted find/replace so
-    a small change does not risk the rest of the document; an edit matching nothing fails loudly.
-  - New content is created as a draft unless you explicitly pass status: "publish".
-  - Deletes go to the trash unless force and confirm are both set.
-  - Destructive and bulk operations preview first and return a confirm_token you must echo back.
+  - Read before you write. update_content's \`edits\` applies targeted find/replace; an edit
+    matching nothing fails loudly.
+  - New content is a draft unless you pass status: "publish". Deletes go to the trash.
+  - Destructive and bulk operations preview first and return a confirm_token to echo back.
 
-Themes: never edit a live theme. create_draft_theme → write/edit files → get_preview_url →
-publish_draft_theme, which backs up the previous theme automatically.
+Themes: never edit a live theme. create_draft_theme → edit files → get_preview_url →
+publish_draft_theme. diff_global_styles and validate_theme_json before and after design work.
 
-Verification: get_page_html fetches what a visitor actually receives, which is the only way to
-confirm a change reached the front end. Caching layers are the usual reason it has not.
+Diagnosing: tail_error_log for errors, profile_url for slow or wrong pages (queries, template,
+assets), security_audit for exposure, backup_status before anything risky.
 
-Some tools (SQL, WP-CLI, theme files, unregistered meta, options, theme mods, site health,
-editable fields) need the wpxmcp companion plugin. test_site reports whether it is installed.`;
+Verification: get_page_html fetches what a visitor actually receives — the only proof a change
+reached the front end. If it has not, purge_cache and check again.
+
+Tools for SQL, WP-CLI, theme files, logs, cache, profiling, plugin settings and admin screens
+need the wpxmcp companion plugin. test_site reports whether it is installed.`;
 
 /**
  * The complete toolset, shared by the stdio and Workers entry points so the two
@@ -68,6 +78,12 @@ export function buildToolset(ctx: ToolContext): Array<ToolSpec<any>> {
     ...powerTools(ctx),
     ...bulkTools(ctx),
     ...skillTools(ctx),
+    ...opsTools(ctx),
+    ...devTools(ctx),
+    ...profilerTools(ctx),
+    ...themeDevTools(ctx),
+    ...growthTools(ctx),
+    ...pluginControlTools(ctx),
   ];
 
   const seen = new Set<string>();

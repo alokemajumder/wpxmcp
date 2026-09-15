@@ -153,6 +153,21 @@ class WPXMCP_Fields {
 				$errors[] = 'A field is missing its `key`.';
 				continue;
 			}
+			// An options-context field is registered as a setting and saved with
+			// update_option(), and every field is exposed to core REST. A key naming a
+			// protected option (or this plugin's own state, such as wpxmcp_snippets)
+			// would let the settings endpoint write it and bypass those safeguards.
+			if ( 0 === strpos( $field_key, 'wpxmcp_' ) || ( 'options' === $context && wpxmcp_is_protected_option( $field_key ) ) ) {
+				$errors[] = sprintf( 'Field key "%s" is reserved — it names a protected option. Choose another key.', $field_key );
+				continue;
+			}
+			if ( 'options' === $context ) {
+				$registered = get_registered_settings();
+				if ( isset( $registered[ $field_key ] ) && ( ! isset( $registered[ $field_key ]['group'] ) || 'wpxmcp_fields' !== $registered[ $field_key ]['group'] ) ) {
+					$errors[] = sprintf( 'Field key "%s" is already a setting registered by WordPress or another plugin; re-registering it would replace its validation. Choose another key.', $field_key );
+					continue;
+				}
+			}
 			if ( ! in_array( $type, self::TYPES, true ) ) {
 				$errors[] = sprintf( 'Field "%s" has unsupported type "%s". Supported: %s.', $field_key, $type, implode( ', ', self::TYPES ) );
 				continue;
@@ -333,8 +348,11 @@ class WPXMCP_Fields {
 	 */
 	public function register_meta() {
 		foreach ( self::groups() as $group ) {
+			if ( ! is_array( $group ) || empty( $group['fields'] ) || ! is_array( $group['fields'] ) ) {
+				continue;
+			}
 			if ( 'post_meta' === $group['context'] ) {
-				foreach ( $group['post_types'] as $post_type ) {
+				foreach ( (array) $group['post_types'] as $post_type ) {
 					foreach ( $group['fields'] as $field ) {
 						register_post_meta( $post_type, $field['key'], array(
 							'type'         => $this->rest_type( $field ),
@@ -354,6 +372,11 @@ class WPXMCP_Fields {
 			}
 
 			foreach ( $group['fields'] as $field ) {
+				// Never re-register a protected option as an editable setting, even if
+				// an older group stored before that check was added names one.
+				if ( wpxmcp_is_protected_option( $field['key'] ) ) {
+					continue;
+				}
 				register_setting( 'wpxmcp_fields', $field['key'], array(
 					'type'         => $this->rest_type( $field ),
 					'description'  => $field['description'],
@@ -709,7 +732,8 @@ JS;
 					continue;
 				}
 
-				update_post_meta( $post_id, $field['key'], $this->sanitize_value( $field, $raw ) );
+				// update_post_meta() unslashes; the value was already unslashed above.
+				update_post_meta( $post_id, $field['key'], wp_slash( $this->sanitize_value( $field, $raw ) ) );
 			}
 		}
 	}
@@ -822,7 +846,7 @@ JS;
 				foreach ( $group['fields'] as $field ) {
 					// phpcs:ignore WordPress.Security.NonceVerification.Missing
 					$raw = isset( $_POST[ $field['key'] ] ) ? wp_unslash( $_POST[ $field['key'] ] ) : ( 'checkbox' === $field['type'] ? array() : null );
-					if ( null === $raw ) {
+					if ( null === $raw || wpxmcp_is_protected_option( $field['key'] ) ) {
 						continue;
 					}
 					update_option( $field['key'], $this->sanitize_value( $field, $raw ) );

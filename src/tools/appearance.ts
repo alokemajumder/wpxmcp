@@ -32,6 +32,28 @@ function shapeMenuItem(i: any) {
   };
 }
 
+/**
+ * An id that is interpolated into a REST path: a template id ("theme//slug"),
+ * a widget id ("block-3"). Slashes are legitimate, but a dot segment, query,
+ * fragment or percent-escape would make the URL resolve to another route.
+ */
+export function routeId(value: string, label: string): string {
+  const clean = String(value ?? "").trim();
+  if (!clean || /[?#\\%\s]/.test(clean) || clean.split("/").some((part) => part === "." || part === "..")) {
+    throw new Error(`"${value}" is not a valid ${label}.`);
+  }
+  return clean;
+}
+
+/** Deep-merges plain objects; arrays and scalars in `patch` replace what was there. */
+export function deepMerge(base: unknown, patch: unknown): unknown {
+  const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!isObj(base) || !isObj(patch)) return patch;
+  const out: Record<string, unknown> = { ...base };
+  for (const [k, v] of Object.entries(patch)) out[k] = k in base ? deepMerge(base[k], v) : v;
+  return out;
+}
+
 /** Renders a flat menu-item list as an indented tree, which is how humans think about menus. */
 function menuTree(items: any[]): string {
   const byParent = new Map<number, any[]>();
@@ -202,6 +224,9 @@ export function appearanceTools(ctx: ToolContext) {
         if ((fields.type === "post_type" || fields.type === "taxonomy") && !fields.object_id) {
           throw new Error(`A "${fields.type}" menu item needs both \`object\` (the post type or taxonomy slug) and \`object_id\`.`);
         }
+        if (fields.type === "post_type_archive" && !fields.object) {
+          throw new Error("A \"post_type_archive\" menu item needs `object` — the slug of the post type whose archive it links to.");
+        }
         const body: Record<string, unknown> = { menus: menu_id, status: "publish" };
         for (const [k, v] of Object.entries(fields)) if (v !== undefined) body[k] = v;
         const res = await client.post<any>("/wp/v2/menu-items", body);
@@ -340,7 +365,7 @@ export function appearanceTools(ctx: ToolContext) {
         site_id: siteIdSchema,
         sidebar: z.string().describe("Target sidebar id, e.g. \"sidebar-1\". See list_sidebars."),
         id_base: z.string().describe("Widget type: \"block\" for a block widget, or a classic type such as \"text\", \"nav_menu\", \"search\", \"categories\", \"recent-posts\"."),
-        instance: z.record(z.any()).optional().describe("Widget settings. For id_base \"block\", use {\"content\": \"<!-- wp:paragraph --><p>Hi</p><!-- /wp:paragraph -->\"}. For \"nav_menu\", {\"title\": \"Menu\", \"nav_menu\": 12}."),
+        instance: z.record(z.string(), z.any()).optional().describe("Widget settings. For id_base \"block\", use {\"content\": \"<!-- wp:paragraph --><p>Hi</p><!-- /wp:paragraph -->\"}. For \"nav_menu\", {\"title\": \"Menu\", \"nav_menu\": 12}."),
         position: z.number().int().optional().describe("Index within the sidebar. Appended if omitted."),
       },
       handler: async ({ site_id, sidebar, id_base, instance, position }) => {
@@ -358,7 +383,7 @@ export function appearanceTools(ctx: ToolContext) {
         // block theme. Re-read it so the caller is told where it actually is.
         let placed = res.data.sidebar;
         try {
-          const actual = await client.get<any>(`/wp/v2/widgets/${id}`, { context: "edit" });
+          const actual = await client.get<any>(`/wp/v2/widgets/${routeId(id, "widget id")}`, { context: "edit" });
           placed = actual.data?.sidebar ?? placed;
         } catch {
           /* keep the create response's answer */
@@ -387,7 +412,7 @@ export function appearanceTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         id: z.string().describe("Widget id, e.g. \"block-3\"."),
-        instance: z.record(z.any()).optional().describe("Replacement settings. Read the widget first — this replaces the instance wholesale."),
+        instance: z.record(z.string(), z.any()).optional().describe("Replacement settings. Read the widget first — this replaces the instance wholesale."),
         sidebar: z.string().optional().describe("Move it to this sidebar."),
         position: z.number().int().optional().describe("New index within the sidebar."),
       },
@@ -399,12 +424,12 @@ export function appearanceTools(ctx: ToolContext) {
         if (sidebar !== undefined) body.sidebar = sidebar;
         if (position !== undefined) body.position = position;
         if (Object.keys(body).length === 0) throw new Error("No changes were supplied.");
-        const res = await client.post<any>(`/wp/v2/widgets/${id}`, body);
+        const res = await client.post<any>(`/wp/v2/widgets/${routeId(id, "widget id")}`, body);
 
         let placed = res.data.sidebar;
         if (sidebar !== undefined) {
           try {
-            const actual = await client.get<any>(`/wp/v2/widgets/${id}`, { context: "edit" });
+            const actual = await client.get<any>(`/wp/v2/widgets/${routeId(id, "widget id")}`, { context: "edit" });
             placed = actual.data?.sidebar ?? placed;
           } catch {
             /* keep the update response's answer */
@@ -437,7 +462,7 @@ export function appearanceTools(ctx: ToolContext) {
       handler: async ({ site_id, id, force }) => {
         const client = site(site_id);
         client.assertWritable("delete_widget");
-        await client.del(`/wp/v2/widgets/${id}`, force ? { force: true } : undefined);
+        await client.del(`/wp/v2/widgets/${routeId(id, "widget id")}`, force ? { force: true } : undefined);
         audit({ site: client.site.id, tool: "delete_widget", action: force ? "delete" : "deactivate", target: id, outcome: "ok" });
         return ok({ deleted: true, permanent: Boolean(force), id },
           force ? undefined : "Moved to the inactive widgets area, so its settings are preserved and it can be dragged back in wp-admin.");
@@ -484,7 +509,7 @@ export function appearanceTools(ctx: ToolContext) {
       handler: async ({ site_id, id, kind }) => {
         const client = site(site_id);
         const route = kind === "template" ? "/wp/v2/templates" : "/wp/v2/template-parts";
-        const res = await client.get<any>(`${route}/${id}`, { context: "edit" });
+        const res = await client.get<any>(`${route}/${routeId(id, "template id")}`, { context: "edit" });
         return ok({
           id: res.data.id, slug: res.data.slug, title: stripHtml(unwrap(res.data.title)),
           theme: res.data.theme, source: res.data.source, area: res.data.area,
@@ -512,7 +537,7 @@ export function appearanceTools(ctx: ToolContext) {
         const route = kind === "template" ? "/wp/v2/templates" : "/wp/v2/template-parts";
         const body: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(fields)) if (v !== undefined) body[k] = v;
-        const res = await client.post<any>(`${route}/${id}`, body);
+        const res = await client.post<any>(`${route}/${routeId(id, "template id")}`, body);
         audit({ site: client.site.id, tool: "update_template", action: "update", target: id, outcome: "ok" });
         return ok({ updated: true, id: res.data.id, source: res.data.source },
           "The customisation is stored in the database, so the theme's original file is untouched and the change can be reverted from the Site Editor.");
@@ -525,8 +550,12 @@ export function appearanceTools(ctx: ToolContext) {
       readOnly: true,
       description:
         "Read a block theme's global styles — the palette, typography, spacing and per-block styling that theme.json defines and the Site Editor overrides. This is where a block theme's design tokens live.",
-      schema: { site_id: siteIdSchema },
-      handler: async ({ site_id }) => {
+      schema: {
+        site_id: siteIdSchema,
+        include_theme_defaults: z.boolean().optional().default(false)
+          .describe("Also return the theme's own theme.json settings and styles, which the user customisations layer on top of. The user record alone only holds what was changed in the Site Editor, so it is often nearly empty. Verbose."),
+      },
+      handler: async ({ site_id, include_theme_defaults }) => {
         const client = site(site_id);
         const themes = await client.get<any[]>("/wp/v2/themes", { status: "active", context: "edit" });
         const active = themes.data[0];
@@ -538,10 +567,22 @@ export function appearanceTools(ctx: ToolContext) {
         const id = active._links?.["wp:user-global-styles"]?.[0]?.href?.split("/").pop();
         if (!id) throw new Error("The active block theme did not expose a global styles id.");
         const res = await client.get<any>(`/wp/v2/global-styles/${id}`, { context: "edit" });
-        return ok({
+        const payload: Record<string, unknown> = {
           is_block_theme: true, active_theme: active.stylesheet, global_styles_id: id,
           settings: res.data.settings, styles: res.data.styles,
-        });
+        };
+        if (include_theme_defaults) {
+          try {
+            const base = await client.get<any>(`/wp/v2/global-styles/themes/${active.stylesheet}`, { context: "edit" });
+            payload.theme_defaults = { settings: base.data?.settings, styles: base.data?.styles };
+          } catch (e: any) {
+            payload.theme_defaults_error = e.message;
+          }
+        }
+        const userEmpty = !Object.keys(res.data.settings ?? {}).length && !Object.keys(res.data.styles ?? {}).length;
+        return ok(payload, userEmpty && !include_theme_defaults
+          ? "No Site Editor customisations are stored yet, so settings and styles are empty. The design tokens come from the theme's theme.json — re-run with include_theme_defaults: true to see them."
+          : undefined);
       },
     }),
 
@@ -549,13 +590,15 @@ export function appearanceTools(ctx: ToolContext) {
       name: "update_global_styles",
       title: "Update global styles",
       description:
-        "Update a block theme's global styles — palette, typography, spacing, per-block styling. Changes apply site-wide immediately. Read them first: this merges at the top level, so a partial `settings` object replaces that whole branch.",
+        "Update a block theme's global styles — palette, typography, spacing, per-block styling. Changes apply site-wide immediately. Read them first: by default this merges only at the top level, so a partial `settings` object replaces that whole branch — pass merge: true to deep-merge instead.",
       schema: {
         site_id: siteIdSchema,
-        settings: z.record(z.any()).optional().describe("theme.json-shaped settings, e.g. {\"color\": {\"palette\": [...]}}."),
-        styles: z.record(z.any()).optional().describe("theme.json-shaped styles, e.g. {\"color\": {\"background\": \"#fff\"}, \"typography\": {...}}."),
+        settings: z.record(z.string(), z.any()).optional().describe("theme.json-shaped settings, e.g. {\"color\": {\"palette\": [...]}}."),
+        styles: z.record(z.string(), z.any()).optional().describe("theme.json-shaped styles, e.g. {\"color\": {\"background\": \"#fff\"}, \"typography\": {...}}."),
+        merge: z.boolean().optional().default(false)
+          .describe("Deep-merge the supplied objects into the current customisations instead of replacing the whole settings/styles branch. Arrays such as a palette are still replaced wholesale."),
       },
-      handler: async ({ site_id, settings, styles }) => {
+      handler: async ({ site_id, settings, styles, merge }) => {
         const client = site(site_id);
         client.assertWritable("update_global_styles");
         if (!settings && !styles) throw new Error("Provide `settings`, `styles`, or both.");
@@ -564,8 +607,10 @@ export function appearanceTools(ctx: ToolContext) {
         const id = active?._links?.["wp:user-global-styles"]?.[0]?.href?.split("/").pop();
         if (!id) throw new Error("The active theme is not a block theme, so it has no global styles to update.");
         const body: Record<string, unknown> = {};
-        if (settings) body.settings = settings;
-        if (styles) body.styles = styles;
+        let current: any = null;
+        if (merge) current = (await client.get<any>(`/wp/v2/global-styles/${id}`, { context: "edit" })).data;
+        if (settings) body.settings = merge ? deepMerge(current?.settings ?? {}, settings) : settings;
+        if (styles) body.styles = merge ? deepMerge(current?.styles ?? {}, styles) : styles;
         const res = await client.post<any>(`/wp/v2/global-styles/${id}`, body);
         audit({ site: client.site.id, tool: "update_global_styles", action: "update", target: id, outcome: "ok" });
         return ok({ updated: true, global_styles_id: id, settings: res.data.settings, styles: res.data.styles });

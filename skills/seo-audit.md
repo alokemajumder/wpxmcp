@@ -1,65 +1,51 @@
 ---
 name: seo-audit
 title: Auditing and fixing SEO
-description: How to detect the active SEO plugin, find missing metadata and alt text, and fix it in bulk.
-keywords: seo, yoast, rank math, aioseo, seopress, meta description, alt text, audit, title tag, schema, sitemap, rank, ranking, google, search engine, traffic, visibility, found on google, seo score
+description: Use for search visibility work — site-wide SEO checks, meta titles and descriptions, noindex and canonical problems, sitemaps, broken and internal links — with Yoast, Rank Math, AIOSEO, SEOPress or The SEO Framework.
+keywords: seo, search engine, google, ranking, rank better, found on google, traffic, meta description, meta descriptions, seo title, title tag, noindex, canonical, sitemap, robots.txt, yoast, rank math, aioseo, seopress, seo framework, schema, open graph, duplicate titles, broken links, internal links, orphan pages, search console, showing up on google, on google, not indexed, indexing
 ---
 
-## 1. Detect the plugin first
+## When this applies
 
-Different plugins store metadata under different meta keys. Run `list_plugins` and look for `wordpress-seo` (Yoast), `seo-by-rank-math`, `all-in-one-seo-pack`, or `wp-seopress`. `get_content_summary` also reports which plugin's fields it found on a given item.
+Improving how the site appears in search, or diagnosing why pages are not indexed. Launch-time indexing switches: `site-launch`. Image alt text for accessibility: `accessibility`.
 
-| Plugin | Title key | Description key |
+## Rules
+
+1. Site-wide blockers first. "Discourage search engines", a robots.txt that disallows `/`, or a noindexed homepage outweighs every per-page fix.
+2. Write SEO fields through `set_seo_meta` (plugin's own route or keys, preview then `confirm_token`). Do not hand-write meta keys: AIOSEO ignores post meta (its data is in its own table) and robots values differ per plugin.
+3. Without an active SEO plugin, core has no meta description, canonical override or per-item noindex; recommend a plugin instead of writing keys nothing reads.
+4. Do not change slugs on published, indexed content without a redirect in place.
+5. No keyword stuffing, no bulk-generated identical descriptions, no link insertion without reading both pages.
+6. The rendered `<head>` is the truth. A correct stored value that does not render means a cache, a theme override, or a second SEO plugin.
+
+## Procedure
+
+1. `seo_site_check` — blog_public, robots.txt, sitemap, homepage head, permalinks, HTTPS and redirect, duplicate titles. Fix every `fail` first.
+2. Content gaps: `audit_content` with `type: "post"` and `limit: 200` (then `type: "page"`) for missing SEO titles/descriptions, duplicate or missing H1, thin content, missing featured images and alt text. `content_inventory` with `format: "csv"` for a spreadsheet view.
+3. One item in depth: `get_seo_meta` with `id` or `url` — detected plugin, stored overrides, what renders, mismatches.
+4. Fix fields: `set_seo_meta` with `id`, `title`, `description` (and `canonical`, `noindex`, `focus_keyword` when needed); review the before → after preview, then repeat with `confirm_token`.
+5. Links: `check_links` with `type: "post"` and `limit: 20` for 4xx/5xx, redirect chains, mixed content and links to drafts or trash (follow `next_cursor`). `internal_link_report` for orphans, dead ends and related pairs; add natural links with `update_content` with `edits`.
+6. Titles in bulk (for example a site-wide `%%title%% | Brand` pattern) belong in the SEO plugin's settings, not in per-post overrides: `list_admin_pages` with `plugin: "wordpress-seo"` (or the active plugin) → `admin_page` with `url_or_page` → `submit_admin_form` with `page` and `changes` (preview, then `confirm_token`).
+7. After changes: `purge_cache` with `scope: "url"` and `url` for each fixed page.
+
+## Verify
+
+- `get_seo_meta` with `id` shows no mismatch between stored and rendered values.
+- `get_page_html` with `url` and `mode: "head"` shows one `<title>`, one meta description, the expected canonical and robots.
+- Re-run `seo_site_check`: no `fail`.
+
+## Report back
+
+Lead with site-wide blockers and whether they are fixed. Then counts (descriptions added, links fixed, orphans linked) and what remains for a human: submitting the sitemap in Search Console, redirects for changed URLs, content rewrites for thin pages. Say that rankings respond over weeks, not immediately.
+
+## Reference: where plugins store per-item fields (read-only knowledge)
+
+| Plugin (slug) | Title / description keys | Robots |
 | --- | --- | --- |
-| Yoast | `_yoast_wpseo_title` | `_yoast_wpseo_metadesc` |
-| Rank Math | `rank_math_title` | `rank_math_description` |
-| AIOSEO | `_aioseo_title` | `_aioseo_description` |
-| SEOPress | `_seopress_titles_title` | `_seopress_titles_desc` |
+| Yoast (`wordpress-seo`) | `_yoast_wpseo_title`, `_yoast_wpseo_metadesc` | `_yoast_wpseo_meta-robots-noindex` `1` = noindex, `2` = index |
+| Rank Math (`seo-by-rank-math`) | `rank_math_title`, `rank_math_description` | `rank_math_robots` array (`noindex`, `nofollow`) |
+| AIOSEO (`all-in-one-seo-pack`) | `wp_aioseo_posts` table (post meta copies are not read) | same table |
+| SEOPress (`wp-seopress`) | `_seopress_titles_title`, `_seopress_titles_desc` | `_seopress_robots_index` = `yes` means noindex |
+| The SEO Framework (`autodescription`) | `_genesis_title`, `_genesis_description` | `_genesis_noindex` `1` |
 
-AIOSEO also mirrors data into its own table, so prefer its REST namespace or an ability over raw meta writes where one exists.
-
-## 2. Find the problems
-
-```
-audit_content   type: "post",  limit: 200   → missing meta, thin content, duplicate titles, missing alt text, h1 problems
-audit_media     check_unused: true          → images with no alt text, and orphaned attachments
-get_page_html   mode: "summary"             → what the rendered page actually emits: title, meta description, canonical, OG tags, h1 count
-```
-
-`get_page_html` is the one that tells the truth. A plugin can be configured correctly and still emit nothing if a template overrides it.
-
-## 3. Fix
-
-Write metadata through the content tools, using the right key for the detected plugin:
-
-```jsonc
-update_content: {
-  id: 42,
-  meta: { "_yoast_wpseo_metadesc": "A specific, 150-character description of this page." }
-}
-```
-
-If the key is not registered with `show_in_rest`, that write is silently ignored — use `set_content_meta` instead, which writes any key through the companion plugin.
-
-Alt text is a media-library fix, not a content fix:
-
-```jsonc
-update_media: { id: 88, alt_text: "A red bicycle leaning against a brick wall" }
-```
-
-## 4. What actually matters
-
-Fix in this order, because this is the order of impact:
-
-1. **Missing or duplicate title tags.** Every page needs one, and it must be distinct.
-2. **Missing meta descriptions** on pages that get traffic. Aim for 140–160 characters, written for a human deciding whether to click.
-3. **Missing alt text.** Accessibility first; search benefit is a side effect. Describe what the image shows, not "image of".
-4. **Thin content** on pages meant to rank.
-5. **Multiple h1 elements.** One per page. The theme usually renders it from the title, so an `<h1>` inside the body is a duplicate.
-6. **Broken internal links** after a slug change. Changing a slug on published content breaks every existing link unless you add a redirect.
-
-## What not to do
-
-- Do not write keyword-stuffed descriptions. They read badly and no longer help.
-- Do not change slugs on published, indexed content without a redirect plugin in place.
-- Do not bulk-rewrite titles without reviewing the plan `bulk_update_content` prints — it previews before it writes for exactly this reason.
+Yoast and Rank Math titles accept template variables (`%%sitename%%`, `%sitename%`). Description length: about 140–160 characters; titles truncate past about 60.

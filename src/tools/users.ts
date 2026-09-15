@@ -57,7 +57,7 @@ export function userTools(ctx: ToolContext) {
           delete query.context; delete query.roles;
           res = await client.get<any[]>("/wp/v2/users", query);
           return ok({
-            site: client.site.id, total: res.total, page: args.page,
+            site: client.site.id, total: res.total ?? res.data.length, total_pages: res.totalPages ?? 1, page: args.page,
             users: res.data.map(shapeUser),
           }, `Only public author profiles were returned — the authenticated user cannot list all users (${e.message}). Emails and roles need an Administrator account.`);
         }
@@ -97,7 +97,7 @@ export function userTools(ctx: ToolContext) {
         last_name: z.string().optional().describe("Family name."),
         url: z.string().optional().describe("Website URL."),
         description: z.string().optional().describe("Author bio."),
-        meta: z.record(z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
+        meta: z.record(z.string(), z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
       },
       handler: async ({ site_id, ...fields }) => {
         const client = site(site_id);
@@ -129,7 +129,7 @@ export function userTools(ctx: ToolContext) {
         url: z.string().optional().describe("Website URL."),
         description: z.string().optional().describe("Longer descriptive text."),
         locale: z.string().optional().describe("User interface locale, e.g. \"en_GB\"."),
-        meta: z.record(z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
+        meta: z.record(z.string(), z.any()).optional().describe("Custom fields as key/value pairs, for keys registered with show_in_rest."),
       },
       handler: async ({ site_id, id, ...fields }) => {
         const client = site(site_id);
@@ -139,7 +139,8 @@ export function userTools(ctx: ToolContext) {
         if (Object.keys(body).length === 0) throw new Error("No fields to update were supplied.");
         const res = await client.post<any>(`/wp/v2/users/${id}`, body);
         audit({ site: client.site.id, tool: "update_user", action: "update", target: id, outcome: "ok", detail: Object.keys(body).join(",") });
-        return ok({ updated: true, changed_fields: Object.keys(body), ...shapeUser(res.data) });
+        return ok({ updated: true, changed_fields: Object.keys(body), ...shapeUser(res.data) },
+          fields.roles?.includes("administrator") ? "This user now has the administrator role and full control of the site." : undefined);
       },
     }),
 
@@ -151,27 +152,40 @@ export function userTools(ctx: ToolContext) {
         "Delete a user. WordPress has no trash for users, so this is permanent and requires confirm: true. You must say what happens to their content: reassign it to another user (strongly preferred) or let it be deleted with them.",
       schema: {
         site_id: siteIdSchema,
-        id: z.number().int().describe("The user ID to delete."),
-        reassign_to: z.number().int().optional().describe("User ID to inherit this user's posts. Omit only if you truly want their content deleted too."),
+        id: z.number().int().min(1).describe("The user ID to delete."),
+        reassign_to: z.number().int().min(1).optional().describe("User ID to inherit this user's posts. Omit only if you truly want their content deleted too."),
         confirm: z.boolean().optional().default(false).describe("Required — user deletion cannot be undone."),
       },
       handler: async ({ site_id, id, reassign_to, confirm }) => {
         const client = site(site_id);
         client.assertWritable("delete_user");
+        if (reassign_to === id) throw new Error("reassign_to cannot be the user being deleted. Pick another user to inherit the content.");
 
         if (!confirm) {
           const current = await client.get<any>(`/wp/v2/users/${id}`, { context: "edit" });
-          const posts = await client.get<any[]>("/wp/v2/posts", { author: id, per_page: 1, status: "any", context: "edit" }).catch(() => ({ total: undefined } as any));
+          let heir: any;
+          if (reassign_to) {
+            heir = await client.get<any>(`/wp/v2/users/${reassign_to}`, { context: "edit" }).catch(() => null);
+            if (!heir) throw new Error(`reassign_to user ${reassign_to} does not exist (or cannot be read), so the preview stopped. Pick an existing user with list_users.`);
+          }
+          const count = async (route: string) =>
+            (await client.get<any[]>(route, { author: id, per_page: 1, status: "any", context: "edit" }).catch(() => ({ total: undefined } as any))).total;
+          const [posts, pages] = await Promise.all([count("/wp/v2/posts"), count("/wp/v2/pages")]);
           audit({ site: client.site.id, tool: "delete_user", action: "delete", target: id, outcome: "refused", detail: "confirm not set" });
           return ok({
             deleted: false, requires_confirmation: true,
             user: shapeUser(current.data),
-            authored_posts: posts.total ?? "unknown",
+            authored_posts: posts ?? "unknown",
+            authored_pages: pages ?? "unknown",
+            authored_other_types_note: "Custom post types and media authored by this user are affected too but not counted here.",
+            reassign_to_user: heir ? { id: heir.data.id, name: heir.data.name } : undefined,
             content_disposition: reassign_to ? `Posts would be reassigned to user ${reassign_to}.` : "No reassign_to was given, so this user's content would be DELETED along with them.",
           }, "User deletion is permanent, so nothing was done. Re-run with confirm: true, ideally alongside reassign_to so the content survives.");
         }
 
-        const res = await client.del<any>(`/wp/v2/users/${id}`, { force: true, reassign: reassign_to ?? "" });
+        // `reassign` is a required parameter: an ID, or "false" to delete the content.
+        // (An empty string is dropped from the query string, which WordPress rejects.)
+        const res = await client.del<any>(`/wp/v2/users/${id}`, { force: true, reassign: reassign_to ?? "false" });
         audit({ site: client.site.id, tool: "delete_user", action: "delete", target: id, outcome: "ok", detail: reassign_to ? `reassigned to ${reassign_to}` : "content deleted" });
         return ok({ deleted: true, id, reassigned_to: reassign_to ?? null, previous: res.data?.previous ? shapeUser(res.data.previous) : undefined });
       },

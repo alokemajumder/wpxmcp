@@ -18,9 +18,17 @@ updates:
         dependency-type: production
         update-types: [patch]
     ignore:
-      # The MCP SDK sets the protocol revision this server speaks; take those
+      # The MCP SDK sets the protocol revisions this server speaks; take those
       # deliberately rather than automatically.
-      - dependency-name: "@modelcontextprotocol/sdk"
+      - dependency-name: "@modelcontextprotocol/*"
+        update-types: [version-update:semver-major]
+      # undici 8 needs Node 22.19+, and its dispatcher must match the undici
+      # inside Node's own fetch; move with the engines field, not before it.
+      - dependency-name: "undici"
+        update-types: [version-update:semver-major]
+      # Type definitions track the oldest supported Node (see engines), so code
+      # cannot compile against APIs that runtime lacks.
+      - dependency-name: "@types/node"
         update-types: [version-update:semver-major]
 
   # The pinned actions in the CI workflow.

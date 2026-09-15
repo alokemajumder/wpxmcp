@@ -1,181 +1,73 @@
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createMcpHandler, type McpServer } from "@modelcontextprotocol/server";
 
 /**
- * A stateless Streamable HTTP transport.
+ * Streamable HTTP for a stateless host such as a Cloudflare Worker.
  *
- * The MCP Streamable HTTP transport allows a server to answer a POST with a
- * single `application/json` body instead of holding an SSE stream open. That is
- * exactly what a Cloudflare Worker wants: no Durable Object, no persistent
- * connection, no session affinity — one request in, one response out, and the
- * isolate can be evicted between calls.
+ * The SDK's `createMcpHandler` serves both protocol eras from one endpoint:
+ * 2026-07-28 requests (no handshake, no session, per-request `_meta`
+ * envelope, `server/discover`) and 2025-era clients through the stateless
+ * `initialize` idiom. A fresh server is built per request, so nothing leaks
+ * between callers and the isolate can be evicted between calls.
  *
- * A fresh McpServer and transport are built per request, so nothing leaks
- * between callers. The trade-off is that server-initiated messages (sampling,
- * elicitation, long-lived progress notifications) are not available; every tool
- * here is a plain request/response, so nothing needs them.
+ * What this wrapper adds is the part the protocol does not cover: a body size
+ * cap, CORS headers on every response, and a JSON-RPC error instead of an
+ * unhandled exception when building the server fails.
  */
-export class StatelessHttpTransport implements Transport {
-  onclose?: () => void;
-  onerror?: (error: Error) => void;
-  onmessage?: (message: JSONRPCMessage) => void;
-  sessionId?: string;
 
-  private outbound: JSONRPCMessage[] = [];
-  private settle?: () => void;
-  private awaitingResponseTo: Set<string | number> = new Set();
-
-  async start(): Promise<void> {
-    /* Nothing to open — the HTTP request is already in flight. */
-  }
-
-  async send(message: JSONRPCMessage): Promise<void> {
-    this.outbound.push(message);
-    const id = (message as { id?: string | number }).id;
-    if (id !== undefined && this.awaitingResponseTo.has(id)) {
-      this.awaitingResponseTo.delete(id);
-      if (this.awaitingResponseTo.size === 0) this.settle?.();
-    }
-  }
-
-  async close(): Promise<void> {
-    this.onclose?.();
-  }
-
-  setProtocolVersion(_version: string): void {
-    /* Negotiation is handled by the SDK; nothing to persist in stateless mode. */
-  }
-
-  /**
-   * Feeds one inbound JSON-RPC message to the server and resolves with whatever
-   * the server sends back — or with nothing, for a notification.
-   */
-  async exchange(message: JSONRPCMessage, timeoutMs: number): Promise<JSONRPCMessage[]> {
-    const id = (message as { id?: string | number }).id;
-    const isRequest = id !== undefined && "method" in message;
-
-    if (!isRequest) {
-      // A notification or response gets no reply; hand it over and return.
-      this.onmessage?.(message);
-      return [];
-    }
-
-    this.awaitingResponseTo.add(id);
-
-    const settled = new Promise<void>((resolve) => {
-      this.settle = resolve;
-    });
-
-    // The timer is always cleared: an un-cleared setTimeout keeps the Node event
-    // loop alive and holds a Workers isolate open after the response is sent.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<void>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`The server did not answer within ${timeoutMs}ms.`)), timeoutMs);
-    });
-
-    try {
-      this.onmessage?.(message);
-      await Promise.race([settled, timeout]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-
-    return this.outbound;
-  }
-}
+/** Tool arguments are small; a base64 media upload is the largest legitimate body. */
+export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 export interface HandleOptions {
-  /** Builds a server instance for this request. */
-  createServer: () => Promise<McpServer> | McpServer;
-  /** How long a single tool call may take. */
-  timeoutMs?: number;
+  /** Builds a server instance. Called per request. */
+  createServer: () => McpServer;
   /** Extra response headers, typically CORS. */
   headers?: Record<string, string>;
+  /** Reported, never sent to the client. */
+  onerror?: (error: Error) => void;
 }
 
-const JSON_HEADERS = { "Content-Type": "application/json" };
-
-function rpcError(id: string | number | null, code: number, message: string, status: number, headers: Record<string, string>) {
-  return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }), {
+function rpcError(code: number, message: string, status: number, headers: Record<string, string>) {
+  return new Response(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code, message } }), {
     status,
-    headers: { ...JSON_HEADERS, ...headers },
+    headers: { "Content-Type": "application/json", ...headers },
   });
 }
 
-/**
- * Serves one MCP request over Streamable HTTP.
- *
- * POST   — a JSON-RPC message; answers with the result, or 202 for a notification.
- * GET    — 405: there is no server-initiated stream in stateless mode.
- * DELETE — 204: there is no session to terminate.
- */
+function withHeaders(res: Response, extra: Record<string, string>): Response {
+  if (!Object.keys(extra).length) return res;
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(extra)) if (!headers.has(k)) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 export async function handleMcpRequest(request: Request, options: HandleOptions): Promise<Response> {
   const headers = options.headers ?? {};
 
-  if (request.method === "GET") {
-    return new Response(
-      JSON.stringify({
-        error: "This endpoint is stateless and does not open an SSE stream. Send MCP messages as HTTP POST to this same URL.",
-      }),
-      { status: 405, headers: { ...JSON_HEADERS, Allow: "POST, DELETE, OPTIONS", ...headers } }
-    );
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    return rpcError(-32600, `Request body is ${declared} bytes; the limit is ${MAX_BODY_BYTES}. Upload large media by URL instead of base64.`, 413, headers);
   }
 
-  if (request.method === "DELETE") {
-    // Clients terminate sessions here; stateless mode has none, so this always succeeds.
-    return new Response(null, { status: 204, headers });
-  }
-
-  if (request.method !== "POST") {
-    return new Response(null, { status: 405, headers: { Allow: "POST, DELETE, OPTIONS", ...headers } });
-  }
-
-  const contentType = request.headers.get("content-type") ?? "";
-  if (!contentType.includes("application/json")) {
-    return rpcError(null, -32700, `Expected Content-Type: application/json, received "${contentType || "(none)"}".`, 415, headers);
-  }
-
-  let payload: unknown;
+  // Configuration errors surface when the server is built; build one up front so
+  // they become a readable JSON-RPC error rather than an opaque 500.
+  let prebuilt: McpServer | undefined;
   try {
-    payload = await request.json();
+    prebuilt = options.createServer();
   } catch (error) {
-    return rpcError(null, -32700, `Request body was not valid JSON: ${error instanceof Error ? error.message : String(error)}`, 400, headers);
+    return rpcError(-32603, `Server configuration error: ${error instanceof Error ? error.message : String(error)}`, 500, headers);
   }
 
-  if (Array.isArray(payload)) {
-    return rpcError(
-      null,
-      -32600,
-      "JSON-RPC batching was removed in MCP protocol revision 2025-06-18. Send one message per request.",
-      400,
-      headers
-    );
-  }
-  if (!payload || typeof payload !== "object" || (payload as any).jsonrpc !== "2.0") {
-    return rpcError(null, -32600, 'Not a JSON-RPC 2.0 message — every message needs `"jsonrpc": "2.0"`.', 400, headers);
-  }
-
-  const message = payload as JSONRPCMessage;
-  const id = (message as { id?: string | number }).id ?? null;
-
-  const server = await options.createServer();
-  const transport = new StatelessHttpTransport();
-
+  // The first build is reused, so a request builds the toolset once.
+  const factory = () => {
+    const server = prebuilt ?? options.createServer();
+    prebuilt = undefined;
+    return server;
+  };
+  const handler = createMcpHandler(factory, { onerror: options.onerror });
   try {
-    await server.connect(transport);
-    const replies = await transport.exchange(message, options.timeoutMs ?? 120000);
-
-    if (replies.length === 0) {
-      // Notifications get no body, per the JSON-RPC and MCP specs.
-      return new Response(null, { status: 202, headers });
-    }
-
-    const body = replies.length === 1 ? replies[0] : replies;
-    return new Response(JSON.stringify(body), { status: 200, headers: { ...JSON_HEADERS, ...headers } });
+    return withHeaders(await handler.fetch(request), headers);
   } catch (error) {
-    return rpcError(id, -32603, error instanceof Error ? error.message : String(error), 500, headers);
-  } finally {
-    await server.close().catch(() => undefined);
+    options.onerror?.(error instanceof Error ? error : new Error(String(error)));
+    return rpcError(-32603, "Internal error while handling the request.", 500, headers);
   }
 }

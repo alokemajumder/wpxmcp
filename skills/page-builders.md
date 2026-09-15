@@ -1,56 +1,57 @@
 ---
 name: page-builders
-title: Working with page builders
-description: How to edit Elementor, Divi, Beaver Builder, Bricks, Breakdance and SeedProd content without corrupting the layout.
-keywords: elementor, divi, beaver builder, bricks, breakdance, seedprod, kadence, page builder, wpbakery, oxygen, layout, theme builder, builder template, landing page
+title: Editing page-builder content
+description: Use before changing any page built with Elementor, Divi, Beaver Builder, Bricks, Breakdance, Oxygen, WPBakery or SeedProd, where the layout is not ordinary block content.
+keywords: elementor, divi, divi 5, beaver builder, bricks, breakdance, oxygen, wpbakery, visual composer, seedprod, page builder, builder, theme builder, builder template, elementor kit, landing page, elementor page, divi page
 ---
 
-## Read this before touching builder content
+## When this applies
 
-Page builders do **not** store layouts in `post_content`. They store a structured document in post meta, and `post_content` holds generated output that is regenerated from that meta. Editing `post_content` therefore either does nothing, or is silently overwritten the next time the builder saves.
+The page was built in a visual builder, or `get_content_meta` returns a `builder_hint`. Kadence Blocks, GenerateBlocks, Spectra and Stackable are real Gutenberg blocks: use `gutenberg`.
 
-**Check first.** Read the meta with `get_content_meta` and look for:
+## Rules
 
-| Meta key | Builder |
-| --- | --- |
-| `_elementor_data`, `_elementor_edit_mode` | Elementor |
-| `_et_pb_use_builder`, `_et_pb_old_content` | Divi |
-| `_fl_builder_data`, `_fl_builder_enabled` | Beaver Builder |
-| `_bricks_page_content_2` | Bricks |
-| `_breakdance_data` | Breakdance |
-| `_seedprod_page` | SeedProd |
-| `_wpb_vc_js_status` | WPBakery |
-| `ct_builder_shortcodes` | Oxygen |
+1. Identify the builder before writing anything. Where the layout lives differs per builder (table below); editing the wrong place does nothing or is overwritten on the next builder save.
+2. Write through the builder's own path first: an ability (`discover_abilities`), then its REST namespace (`discover_rest_routes`), then direct edits. Never invent a route.
+3. Meta writes are not revisioned. Before `set_content_meta`, keep the exact original value so it can be written back.
+4. Change only the target value. Keep every element id, type, `elType`/`widgetType`/`name` and settings key; builders drop elements they cannot match.
+5. Elementor's `_elementor_data` must be written back as a JSON **string**. Passing an object stores a PHP array and breaks the page.
+6. Do not write `_fl_builder_data` (Beaver Builder), Oxygen classic shortcodes or SeedProd layouts through tools: the round trip loses PHP object types, invalidates Oxygen's shortcode signatures, or targets a column core REST cannot reach. Tell the owner to make that edit in the builder.
+7. Never replace `post_content` of an Elementor, Beaver Builder, Bricks or Breakdance page; it is generated output.
 
-If none are present, it is ordinary Gutenberg or classic content — load the `gutenberg` skill instead.
+## Procedure
 
-## The general rule
+1. `get_content_meta` with `id` and `include_protected: true`. Match the keys against the table. Values over 20,000 characters are truncated; request them by name with `keys: ["_elementor_data"]`.
+2. `discover_abilities` with `search: "{builder name}"`; if one edits content, `get_ability_info` then `run_ability`. Otherwise `discover_rest_routes` with `search: "{builder slug}"`.
+3. Edit by storage type:
+   - **Shortcodes or block comments in `post_content`** (Divi 4, Divi 5, WPBakery): `get_content` with `id`, then `update_content` with `edits`, matching text inside the shortcode or JSON and leaving attributes untouched. In Divi 5 JSON, text is often HTML-escaped (`<` for `<`): match it exactly as stored.
+   - **JSON/array in meta** (Elementor, Bricks, Breakdance): parse, change the one value, re-encode, then `set_content_meta` with `id` and `meta`. For Breakdance, `tree_json_string` is JSON inside JSON: decode and re-encode both levels.
+4. Clear the builder's generated CSS so the front end rebuilds it:
+   - Elementor: in the same `set_content_meta` call pass `"_elementor_css": null` and `"_elementor_element_cache": null` (null deletes the key; both regenerate on the next view).
+   - Divi, Beaver Builder, Bricks (external CSS files mode), Breakdance: no tool clears their CSS files. Saving through WordPress usually regenerates Divi's; otherwise ask the owner to use the builder's "clear/regenerate CSS" setting.
+5. `purge_cache` with `scope: "url"` and `url: "{page path}"`.
 
-Write through the builder's own save path, never around it. In order of preference:
+Global styles live elsewhere: Elementor's global colors and fonts are the Kit, a post whose id is in the `elementor_active_kit` option (`get_options` with `names: ["elementor_active_kit"]`), stored in its `_elementor_page_settings` meta. Theme-builder headers, footers and templates are posts of their own type (Elementor `elementor_library`, Divi `et_header_layout`/`et_body_layout`/`et_footer_layout`, Bricks `bricks_template`, Breakdance `breakdance_header`/`breakdance_footer`/`breakdance_template`); find them with `inspect_registry` with `kind: "post_types"` and `filter: "{builder}"`.
 
-1. **An ability** — `discover_abilities`, then `run_ability`. The plugin's own validation and cache invalidation run.
-2. **The plugin's REST namespace** — `discover_rest_routes` with the builder's namespace. Never guess a route.
-3. **WP-CLI** — `run_wp_cli`, if the builder registers commands.
-4. **Meta writes plus a cache flush** — the last resort, described below.
+## Verify
 
-## Editing the structured document
+- `get_page_html` with `url` and `mode: "text"` shows the new wording; `mode: "html"` shows styling classes.
+- If the page is unchanged, read `verification` in the `purge_cache` result (a `hit` means a CDN still holds the old copy), then confirm the meta write with `get_content_meta` with `keys`.
 
-When you must write meta directly:
+## Report back
 
-1. `get_content_meta` with `include_protected: true` to read the current document.
-2. Parse it. Elementor's `_elementor_data` is a JSON string of nested element objects; Beaver Builder's is a serialised PHP object; Bricks stores JSON.
-3. Change **only** the value you are targeting, leaving every id, `elType`, `widgetType` and settings key intact. Builders key off element ids — invent one and the element disappears from the editor.
-4. Write it back with `set_content_meta`.
-5. **Flush the builder's CSS cache.** This is the step people forget, and it is why the change "doesn't show":
-   - Elementor: `run_wp_cli "option delete elementor_css_print_method"` then regenerate, or delete the `_elementor_css` meta on that post.
-   - Divi: `run_wp_cli "option delete et_pb_static_css_file"`, or clear `wp-content/et-cache`.
-   - Beaver Builder / Bricks / Breakdance: each keeps a per-post cached CSS file; clearing the post's builder cache meta forces a rebuild.
-6. Verify with `get_page_html` that the front end actually changed.
+Name the builder, what changed, and where (meta key or content). State that meta edits have no revision history, and list any step the owner must do in the builder (CSS regeneration, Beaver Builder or Oxygen edits).
 
-## Kadence and GeneratePress
+## Reference: where each builder keeps the layout
 
-These are *not* in the above category. Kadence Blocks content is real Gutenberg markup — use the `gutenberg` skill, and set global colors through `update_global_styles`. GeneratePress Elements are a custom post type (`gp_elements`) you can manage with the normal content tools.
-
-## Safest path of all
-
-For a new page, do not fight the builder: build it as a classic template or clean Gutenberg content instead, unless the client specifically needs to keep editing it in that builder. If they do, and no ability or REST route exists, say so plainly rather than writing meta blind.
+| Builder | Detect (meta) | Layout lives in |
+| --- | --- | --- |
+| Elementor | `_elementor_edit_mode` = `builder`, `_elementor_data` | `_elementor_data`: JSON string of nested elements (`id`, `elType`, `widgetType`, `settings`, `elements`) |
+| Divi 4 | `_et_pb_use_builder` = `on` | `post_content` shortcodes `[et_pb_section]…`; `_et_pb_old_content` is only the pre-Divi backup |
+| Divi 5 | `_et_pb_use_builder` = `on`, content starts with `<!-- wp:divi/` | `post_content` block comments in the `divi/` namespace, settings in the comment JSON |
+| Beaver Builder | `_fl_builder_enabled` = `1` | `_fl_builder_data` (published) and `_fl_builder_draft`: serialized PHP objects |
+| Bricks | `_bricks_editor_mode` = `bricks` | `_bricks_page_content_2`: array of elements (`id`, `name`, `parent`, `children`, `settings`) |
+| Breakdance | `_breakdance_data` | JSON with a nested `tree_json_string` |
+| Oxygen classic | `ct_builder_shortcodes` or `ct_builder_json` | Those keys; shortcodes are signed |
+| WPBakery | `_wpb_vc_js_status` = `true` | `post_content` shortcodes `[vc_row]…`; design CSS in `_wpb_shortcodes_custom_css` |
+| SeedProd | `_seedprod_page` | JSON in `post_content_filtered` (not in core REST) |

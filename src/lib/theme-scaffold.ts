@@ -17,6 +17,62 @@ export interface ScaffoldOptions {
 }
 
 /**
+ * Text that is safe on one theme-header line and inside a CSS or PHP block
+ * comment.
+ *
+ * The name, description and author are interpolated into style.css's header
+ * comment and into PHP docblocks. A newline would inject extra header fields
+ * (a stray "Template:" turns the theme into a child of something else), and a
+ * closing comment marker would end the docblock and let the rest of the value
+ * run as PHP — which the syntax check happily accepts.
+ */
+export function headerText(value: string | undefined, max = 200): string {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\*\//g, "* /")
+    .replace(/\/\*/g, "/ *")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+/** A theme directory name / text domain: lowercase letters, digits and hyphens. */
+export function sanitizeThemeSlug(value: string | undefined): string {
+  return String(value ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * A valid PHP identifier prefix for the theme's functions and constants.
+ * PHP identifiers cannot start with a digit, so "3d-studio" becomes
+ * "theme_3d_studio" rather than a parse error in functions.php.
+ */
+export function phpPrefix(slug: string): string {
+  const base = sanitizeThemeSlug(slug).replace(/-/g, "_");
+  return !base || /^[0-9]/.test(base) ? `theme_${base}`.replace(/_+$/, "") : base;
+}
+
+/**
+ * A design token as a single CSS value. Declaration and block terminators,
+ * comment markers and unbalanced quotes are removed so a token cannot close
+ * the :root rule or swallow the rest of theme.css.
+ */
+export function cssToken(value: string | undefined, fallback: string): string {
+  if (value === undefined || value === null) return fallback;
+  let v = String(value).replace(/[;{}<>\\\u0000-\u001f]/g, "").replace(/\/\*|\*\//g, "").trim();
+  for (const quote of ["'", '"']) {
+    if ((v.split(quote).length - 1) % 2 !== 0) v = v.split(quote).join("");
+  }
+  return v.slice(0, 300) || fallback;
+}
+
+/**
  * A complete classic PHP theme styled with Tailwind utilities.
  *
  * Classic templates beat generated block markup for this job: the output is
@@ -25,16 +81,25 @@ export interface ScaffoldOptions {
  * and Tailwind is configured to read those properties — so restyling the site
  * means editing one file, not hunting hex codes through templates.
  */
-export function classicThemeScaffold(opts: ScaffoldOptions): Record<string, string> {
+export function classicThemeScaffold(input: ScaffoldOptions): Record<string, string> {
+  const slug = sanitizeThemeSlug(input.slug);
+  if (!slug) throw new Error("The theme slug must contain at least one letter or digit.");
+  const opts: ScaffoldOptions = {
+    name: headerText(input.name, 100) || slug,
+    slug,
+    description: headerText(input.description, 500),
+    author: headerText(input.author, 100),
+    tokens: input.tokens ?? {},
+  };
   const t = opts.tokens;
-  const primary = t.primary ?? "#1d4ed8";
-  const accent = t.accent ?? "#0ea5e9";
-  const ink = t.ink ?? "#111827";
-  const surface = t.surface ?? "#ffffff";
-  const fontSans = t.font_sans ?? "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
-  const fontSerif = t.font_serif ?? "ui-serif, Georgia, Cambria, 'Times New Roman', serif";
-  const radius = t.radius ?? "0.75rem";
-  const fn = opts.slug.replace(/-/g, "_");
+  const primary = cssToken(t.primary, "#1d4ed8");
+  const accent = cssToken(t.accent, "#0ea5e9");
+  const ink = cssToken(t.ink, "#111827");
+  const surface = cssToken(t.surface, "#ffffff");
+  const fontSans = cssToken(t.font_sans, "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif");
+  const fontSerif = cssToken(t.font_serif, "ui-serif, Georgia, Cambria, 'Times New Roman', serif");
+  const radius = cssToken(t.radius, "0.75rem");
+  const fn = phpPrefix(slug);
 
   const files: Record<string, string> = {};
 

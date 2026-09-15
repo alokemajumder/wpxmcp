@@ -60,7 +60,29 @@ class WPXMCP_REST {
 				array( 'status' => 403 )
 			);
 		}
+		// On multisite a sub-site administrator holds manage_options too, but SQL,
+		// plugin installs and theme files reach every site on the network.
+		if ( is_multisite() && ! is_super_admin() ) {
+			return new WP_Error(
+				'wpxmcp_forbidden',
+				'On multisite this endpoint requires a network super admin. A site administrator cannot reach network-wide data through it.',
+				array( 'status' => 403 )
+			);
+		}
 		return true;
+	}
+
+	/**
+	 * The autoload column values that mean "loaded on every request".
+	 *
+	 * WordPress 6.6 replaced 'yes' with 'on' / 'auto-on' / 'auto'.
+	 *
+	 * @return string SQL IN-list, already escaped.
+	 */
+	public static function autoload_in_sql() {
+		global $wpdb;
+		$values = function_exists( 'wp_autoload_values_to_autoload' ) ? wp_autoload_values_to_autoload() : array( 'yes' );
+		return "'" . implode( "','", array_map( 'esc_sql', (array) $values ) ) . "'";
 	}
 
 	/**
@@ -258,7 +280,7 @@ class WPXMCP_REST {
 			return $b['bytes'] <=> $a['bytes'];
 		} );
 
-		$autoload = (int) $wpdb->get_var( "SELECT SUM(LENGTH(option_value)) FROM {$wpdb->options} WHERE autoload = 'yes'" ); // phpcs:ignore WordPress.DB
+		$autoload = (int) $wpdb->get_var( "SELECT SUM(LENGTH(option_value)) FROM {$wpdb->options} WHERE autoload IN (" . self::autoload_in_sql() . ')' ); // phpcs:ignore WordPress.DB
 
 		return array(
 			'total_bytes'          => $total,
@@ -341,6 +363,10 @@ class WPXMCP_REST {
 			}
 			require_once $file;
 		}
+		// Several direct tests call admin-only helpers that a REST request has not loaded.
+		foreach ( array( 'misc.php', 'file.php', 'update.php', 'plugin.php', 'theme.php' ) as $include ) {
+			require_once ABSPATH . 'wp-admin/includes/' . $include;
+		}
 
 		$health  = WP_Site_Health::get_instance();
 		$tests   = WP_Site_Health::get_tests();
@@ -351,7 +377,7 @@ class WPXMCP_REST {
 			if ( ! $method ) {
 				continue;
 			}
-			$callable = is_string( $method ) ? array( $health, 'get_test_' . $method ) : $method;
+			$callable = ( is_string( $method ) && method_exists( $health, 'get_test_' . $method ) ) ? array( $health, 'get_test_' . $method ) : $method;
 			if ( ! is_callable( $callable ) ) {
 				continue;
 			}
@@ -418,21 +444,31 @@ class WPXMCP_REST {
 	public function run_sql( $request ) {
 		global $wpdb;
 
-		$query    = trim( (string) $request->get_param( 'query' ) );
-		$readonly = (bool) $request->get_param( 'readonly' );
+		// Trailing terminators are harmless but would break the appended LIMIT.
+		$query    = rtrim( trim( (string) $request->get_param( 'query' ) ), "; \t\n\r" );
+		$readonly = rest_sanitize_boolean( $request->get_param( 'readonly' ) );
 		$max_rows = min( 1000, max( 1, (int) $request->get_param( 'max_rows' ) ) );
 
 		if ( '' === $query ) {
 			return new WP_Error( 'wpxmcp_empty_query', 'No query supplied.', array( 'status' => 400 ) );
 		}
 
+		// Everything below inspects the statement as MySQL will parse it: string
+		// literals blanked, comments removed, executable comments kept.
+		$code = self::sql_code( $query );
+
 		// Reject stacked statements outright.
-		$without_strings = preg_replace( "/'(?:[^'\\\\]|\\\\.)*'|\"(?:[^\"\\\\]|\\\\.)*\"/", "''", $query );
-		if ( substr_count( rtrim( $without_strings, "; \t\n\r" ), ';' ) > 0 ) {
+		if ( false !== strpos( $code, ';' ) ) {
 			return new WP_Error( 'wpxmcp_stacked_query', 'Multiple statements in one query are refused.', array( 'status' => 400 ) );
 		}
 
-		$is_read = (bool) preg_match( '/^\s*(select|show|describe|desc|explain|with)\b/i', $query );
+		// Reading or writing server files turns SQL access into filesystem access
+		// (and, via INTO OUTFILE, code execution). Refused in every mode.
+		if ( preg_match( '/\binto\s+(?:outfile|dumpfile)\b|\bload_file\s*\(|\bload\s+(?:data|xml)\b/i', $code ) ) {
+			return new WP_Error( 'wpxmcp_sql_file_access', 'Statements that read or write files on the database server (INTO OUTFILE, INTO DUMPFILE, LOAD_FILE, LOAD DATA) are refused.', array( 'status' => 403 ) );
+		}
+
+		$is_read = (bool) preg_match( '/^\s*(select|show|describe|desc|explain|with)\b/i', $code );
 
 		if ( $readonly && ! $is_read ) {
 			return new WP_Error(
@@ -454,7 +490,25 @@ class WPXMCP_REST {
 			}
 		}
 
+		// Bound the fetch in the database rather than after loading every row into
+		// PHP memory, which fatals on a large table.
+		if ( $is_read
+			&& preg_match( '/^\s*(select|with)\b/i', $code )
+			&& ! preg_match( '/\blimit\b|\binto\b|\bfor\s+(?:update|share)\b|\block\s+in\s+share\s+mode\b|\bprocedure\b/i', $code ) ) {
+			$query .= "\nLIMIT " . ( $max_rows + 1 );
+		}
+
 		$wpdb->suppress_errors( true );
+
+		// A leading SELECT/WITH/EXPLAIN keyword does not make a statement harmless:
+		// MySQL 8 accepts "WITH ... DELETE" and "EXPLAIN ANALYZE" executes the
+		// statement. A read-only transaction makes the server enforce it. Servers
+		// too old for the syntax also predate both of those forms.
+		$read_only_txn = false;
+		if ( $readonly ) {
+			$read_only_txn = false !== $wpdb->query( 'START TRANSACTION READ ONLY' ); // phpcs:ignore WordPress.DB
+		}
+
 		$start = microtime( true );
 
 		if ( $is_read ) {
@@ -465,6 +519,10 @@ class WPXMCP_REST {
 
 		$elapsed = round( ( microtime( true ) - $start ) * 1000, 1 );
 		$error   = $wpdb->last_error;
+
+		if ( $read_only_txn ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+		}
 		$wpdb->suppress_errors( false );
 
 		if ( $error ) {
@@ -474,11 +532,14 @@ class WPXMCP_REST {
 		wpxmcp_audit( 'sql', array( 'query' => substr( $query, 0, 500 ), 'readonly' => $is_read ) );
 
 		if ( $is_read ) {
-			$rows = is_array( $rows ) ? array_slice( $rows, 0, $max_rows ) : array();
+			$rows      = is_array( $rows ) ? $rows : array();
+			$truncated = count( $rows ) > $max_rows;
+			$rows      = array_slice( $rows, 0, $max_rows );
 			return array(
 				'rows'       => $rows,
 				'columns'    => ! empty( $rows ) ? array_keys( $rows[0] ) : array(),
 				'row_count'  => count( $rows ),
+				'truncated'  => $truncated,
 				'elapsed_ms' => $elapsed,
 			);
 		}
@@ -488,6 +549,88 @@ class WPXMCP_REST {
 			'elapsed_ms'    => $elapsed,
 			'note'          => 'Raw SQL bypasses WordPress hooks. Object and page caches were not invalidated — run "cache flush" via run_wp_cli if the change should be visible immediately.',
 		);
+	}
+
+	/**
+	 * The parts of a statement MySQL executes as code.
+	 *
+	 * String literals and quoted identifiers are reduced to empty quotes, and
+	 * comments are removed — except executable comments, whose contents MySQL
+	 * runs and so must be inspected. A regex cannot do this reliably: a quote
+	 * inside a comment, or a comment marker inside a string, hides whatever
+	 * follows from a naive pattern.
+	 *
+	 * @param string $sql Statement.
+	 * @return string
+	 */
+	public static function sql_code( $sql ) {
+		$sql = (string) $sql;
+		$len = strlen( $sql );
+		$out = '';
+		$i   = 0;
+
+		while ( $i < $len ) {
+			$c    = $sql[ $i ];
+			$next = ( $i + 1 < $len ) ? $sql[ $i + 1 ] : '';
+
+			if ( "'" === $c || '"' === $c || '`' === $c ) {
+				$quote = $c;
+				$i++;
+				while ( $i < $len ) {
+					if ( '\\' === $sql[ $i ] && '`' !== $quote ) {
+						$i += 2;
+						continue;
+					}
+					if ( $sql[ $i ] === $quote ) {
+						if ( $i + 1 < $len && $sql[ $i + 1 ] === $quote ) {
+							$i += 2;
+							continue;
+						}
+						break;
+					}
+					$i++;
+				}
+				$i++;
+				$out .= $quote . $quote;
+				continue;
+			}
+
+			if ( '#' === $c || ( '-' === $c && '-' === $next && ( $i + 2 >= $len || ctype_space( $sql[ $i + 2 ] ) || ctype_cntrl( $sql[ $i + 2 ] ) ) ) ) {
+				$end  = strpos( $sql, "\n", $i );
+				$i    = ( false === $end ) ? $len : $end;
+				$out .= ' ';
+				continue;
+			}
+
+			if ( '/' === $c && '*' === $next ) {
+				$marker = substr( $sql, $i + 2, 2 );
+				if ( '!' === substr( $marker, 0, 1 ) || 'M!' === $marker ) {
+					// Executable comment (MySQL /*!, MariaDB /*M!): its body runs.
+					$i += ( 'M!' === $marker ) ? 4 : 3;
+					while ( $i < $len && ctype_digit( $sql[ $i ] ) ) {
+						$i++;
+					}
+					$out .= ' ';
+					continue;
+				}
+				$end  = strpos( $sql, '*/', $i + 2 );
+				$i    = ( false === $end ) ? $len : $end + 2;
+				$out .= ' ';
+				continue;
+			}
+
+			if ( '*' === $c && '/' === $next ) {
+				// Closes an executable comment.
+				$i   += 2;
+				$out .= ' ';
+				continue;
+			}
+
+			$out .= $c;
+			$i++;
+		}
+
+		return $out;
 	}
 
 	/* ------------------------------------------------------------------ *
@@ -506,7 +649,7 @@ class WPXMCP_REST {
 			return new WP_Error( 'wpxmcp_no_post', 'No post with that ID.', array( 'status' => 404 ) );
 		}
 
-		$include_protected = (bool) $request->get_param( 'include_protected' );
+		$include_protected = rest_sanitize_boolean( $request->get_param( 'include_protected' ) );
 		$only              = array_filter( array_map( 'trim', explode( ',', (string) $request->get_param( 'keys' ) ) ) );
 
 		$all = get_post_meta( $post_id );
@@ -521,8 +664,9 @@ class WPXMCP_REST {
 			}
 			$value = count( $values ) === 1 ? maybe_unserialize( $values[0] ) : array_map( 'maybe_unserialize', $values );
 
-			// Very large values (page-builder documents) are summarised rather than dumped.
-			if ( is_string( $value ) && strlen( $value ) > 20000 ) {
+			// Very large values (page-builder documents) are summarised rather than
+			// dumped, unless the caller asked for the key by name.
+			if ( ! $only && is_string( $value ) && strlen( $value ) > 20000 ) {
 				$out[ $key ] = array(
 					'__truncated' => true,
 					'length'      => strlen( $value ),
@@ -596,7 +740,9 @@ class WPXMCP_REST {
 				$written[ $key ] = null;
 				continue;
 			}
-			update_post_meta( $post_id, $key, $value );
+			// Metadata functions unslash their input; without this, backslashes in
+			// JSON documents (Elementor, block attributes) are silently stripped.
+			update_post_meta( $post_id, $key, wp_slash( $value ) );
 			$written[ $key ] = get_post_meta( $post_id, $key, true );
 		}
 
@@ -636,7 +782,7 @@ class WPXMCP_REST {
 			), ARRAY_A );
 		} else {
 			$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB
-				"SELECT option_name, autoload, LENGTH(option_value) AS len FROM {$wpdb->options} WHERE autoload = 'yes' ORDER BY len DESC LIMIT %d",
+				"SELECT option_name, autoload, LENGTH(option_value) AS len FROM {$wpdb->options} WHERE autoload IN (" . self::autoload_in_sql() . ') ORDER BY len DESC LIMIT %d',
 				$limit
 			), ARRAY_A );
 		}
@@ -670,12 +816,12 @@ class WPXMCP_REST {
 			return new WP_Error( 'wpxmcp_no_option', 'Supply an option `name`.', array( 'status' => 400 ) );
 		}
 
-		// Options that would lock out the site or break the REST connection.
-		$blocked = array( 'siteurl', 'home', 'active_plugins', 'template', 'stylesheet' );
-		if ( in_array( $name, $blocked, true ) ) {
+		// Options that would lock out the site, break the REST connection, or
+		// bypass this plugin's own safeguards.
+		if ( wpxmcp_is_protected_option( $name ) ) {
 			return new WP_Error(
 				'wpxmcp_protected_option',
-				sprintf( 'The option "%s" is protected — writing it can lock you out of the site or break this connection. Use the dedicated tool instead (activate_theme, activate_plugin, or wp-admin for URLs).', $name ),
+				sprintf( 'The option "%s" is protected — writing it can lock you out of the site, break this connection, or bypass wpxmcp\'s own safeguards. Use the dedicated tool instead (activate_theme, activate_plugin, code_snippet, or wp-admin for URLs).', $name ),
 				array( 'status' => 403 )
 			);
 		}
@@ -687,7 +833,7 @@ class WPXMCP_REST {
 		if ( null === $autoload ) {
 			update_option( $name, $value );
 		} else {
-			update_option( $name, $value, (bool) $autoload );
+			update_option( $name, $value, rest_sanitize_boolean( $autoload ) );
 		}
 
 		wpxmcp_audit( 'set_option', array( 'name' => $name ) );
@@ -717,8 +863,8 @@ class WPXMCP_REST {
 	 */
 	public function set_theme_mod( $request ) {
 		$key = (string) $request->get_param( 'key' );
-		if ( '' === $key ) {
-			return new WP_Error( 'wpxmcp_no_key', 'Supply a theme mod `key`.', array( 'status' => 400 ) );
+		if ( '' === trim( $key ) || strlen( $key ) > 191 || preg_match( '/[\x00-\x1f\x7f]/', $key ) ) {
+			return new WP_Error( 'wpxmcp_no_key', 'Supply a theme mod `key`: a non-empty name of at most 191 characters, without control characters.', array( 'status' => 400 ) );
 		}
 		$previous = get_theme_mod( $key );
 		set_theme_mod( $key, $request->get_param( 'value' ) );

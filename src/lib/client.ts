@@ -22,7 +22,7 @@ export interface WPResponse<T = any> {
   totalPages?: number;
 }
 
-const USER_AGENT = "wpxmcp/1.0 (+https://github.com/wpxmcp/wpxmcp)";
+const USER_AGENT = "wpxmcp/2.0 (+https://github.com/alokemajumder/wpxmcp)";
 
 /** UTF-8 safe base64 encode that works on both Node and Workers. */
 function encodeBase64(input: string): string {
@@ -42,6 +42,29 @@ const RETRYABLE_NETWORK = new Set([
 ]);
 
 const MAX_ATTEMPTS = 3;
+const MAX_REDIRECTS = 5;
+
+/** A PHP warning printed ahead of the JSON when display_errors is on. */
+const PHP_NOTICE = /^\s*(?:<br\s*\/?>\s*)?(?:<b>)?(?:PHP )?(?:Warning|Notice|Deprecated|Strict Standards|Fatal error)(?:<\/b>)?:[\s\S]*? on line (?:<b>)?\d+(?:<\/b>)?(?:<br\s*\/?>)?/i;
+
+/**
+ * Decodes a response body. JSON is recovered even when PHP notices precede it —
+ * with display_errors on they are printed before WordPress sends its headers,
+ * which also downgrades the Content-Type to text/html. Anything else stays text.
+ */
+function parseBody(text: string, contentType: string): unknown {
+  let candidate = text;
+  while (PHP_NOTICE.test(candidate)) candidate = candidate.replace(PHP_NOTICE, "");
+  const trimmed = candidate.trim();
+  if (contentType.includes("json") || candidate !== text || /^[[{]/.test(trimmed)) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      /* not JSON after all */
+    }
+  }
+  return text;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -79,7 +102,13 @@ export class WordPressClient {
 
   /** Builds the full REST URL, supporting both pretty and ?rest_route= sites. */
   buildUrl(route: string, query?: Record<string, unknown>): string {
-    const clean = route.startsWith("/") ? route : `/${route}`;
+    // A route may carry its own query string ("/wp/v2/posts?status=draft"). It
+    // must be split off first: in ?rest_route= mode it would otherwise be encoded
+    // into the rest_route value and the site would answer rest_no_route.
+    const queryAt = route.indexOf("?");
+    const path = queryAt === -1 ? route : route.slice(0, queryAt);
+    const inlineQuery = queryAt === -1 ? "" : route.slice(queryAt + 1);
+    const clean = path.startsWith("/") ? path : `/${path}`;
     const prefix = this.site.restPrefix ?? "/wp-json";
     let url: URL;
     if (prefix.includes("rest_route")) {
@@ -87,6 +116,9 @@ export class WordPressClient {
       url.searchParams.set("rest_route", clean);
     } else {
       url = new URL(this.site.url + prefix.replace(/\/+$/, "") + clean);
+    }
+    for (const [key, value] of new URLSearchParams(inlineQuery)) {
+      if (key !== "rest_route") url.searchParams.append(key, value);
     }
     if (query) {
       for (const [key, value] of Object.entries(query)) {
@@ -212,21 +244,52 @@ export class WordPressClient {
     const timeoutMs = options.timeoutMs ?? this.site.timeoutMs ?? 60000;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const dispatcher = await this.dispatcher();
 
+    // The timer spans the whole exchange, body included: a server that sends
+    // headers and then stalls would otherwise hang the call indefinitely.
     let res: Response;
+    let text: string;
     try {
-      res = await fetch(url, {
-        method,
-        headers,
-        body,
-        signal: controller.signal,
-        redirect: "follow",
-        // @ts-expect-error undici-specific option, honoured by Node's global fetch
-        dispatcher: await this.dispatcher(),
-      });
+      let current = url;
+      for (let hop = 0; ; hop++) {
+        // Redirects are followed by hand. fetch's automatic handling turns a
+        // redirected POST into a body-less GET — a write that silently becomes a
+        // read and reports success — and forwards custom site headers (Access
+        // tokens, staging gates) to whatever origin the Location names.
+        res = await fetch(current, {
+          method,
+          headers,
+          body,
+          signal: controller.signal,
+          redirect: "manual",
+          // @ts-expect-error undici-specific option, honoured by Node's global fetch
+          dispatcher,
+        });
+        const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+        if (!location) break;
+
+        const next = new URL(location, current);
+        const sameOrigin = next.origin === new URL(current).origin;
+        const keepsMethod = res.status === 307 || res.status === 308 || method === "GET";
+        await res.body?.cancel().catch(() => undefined);
+        if (!sameOrigin || !keepsMethod || hop >= MAX_REDIRECTS) {
+          throw new WPError(
+            `The site redirected ${method} ${current} to ${next.toString()} (HTTP ${res.status}), so the request was stopped.`,
+            res.status, "redirect", url, method, undefined,
+            !sameOrigin
+              ? "The redirect leads to a different origin, where credentials are not sent. Set this site's url to the address WordPress actually answers on — usually the https:// or www. form."
+              : hop >= MAX_REDIRECTS
+                ? "Too many redirects — the site is probably redirecting in a loop."
+                : `Following it would turn this ${method} into a GET and drop its body. Check the site url and restPrefix — typically a trailing-slash or permalink rule is rewriting REST requests.`
+          );
+        }
+        current = next.toString();
+      }
+      text = await res.text();
     } catch (e: any) {
-      clearTimeout(timer);
-      if (e?.name === "AbortError") {
+      if (e instanceof WPError) throw e;
+      if (e?.name === "AbortError" || controller.signal.aborted) {
         throw new WPError(`Request timed out after ${timeoutMs}ms.`, 0, "timeout", url, method, undefined,
           "Raise timeoutMs for this site, or narrow the request (smaller per_page, fewer fields).");
       }
@@ -242,20 +305,9 @@ export class WordPressClient {
       clearTimeout(timer);
     }
 
-    const text = await res.text();
     let data: any = null;
     const contentType = res.headers.get("content-type") ?? "";
-    if (text) {
-      if (contentType.includes("json")) {
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = text;
-        }
-      } else {
-        data = text;
-      }
-    }
+    if (text) data = parseBody(text, contentType);
 
     if (!res.ok) {
       const code = typeof data === "object" && data ? data.code : undefined;
@@ -282,6 +334,14 @@ export class WordPressClient {
         "The site returned HTML where JSON was expected.",
         res.status, "html_response", url, method, data.slice(0, 400),
         "This is almost always a security plugin or WAF serving a challenge page, or a caching layer returning the wrong document. Allowlist this client, or check the REST prefix."
+      );
+    }
+
+    if (typeof data === "string" && contentType.includes("json")) {
+      throw new WPError(
+        "The site declared JSON but sent a body that does not parse as JSON.",
+        res.status, "invalid_json", url, method, data.slice(0, 400),
+        "Usually PHP output leaking into the response — a warning printed with display_errors on, or stray whitespace from a plugin file. Turn off display_errors (WP_DEBUG_DISPLAY false) and check the PHP error log."
       );
     }
 
@@ -371,12 +431,19 @@ export class WordPressClient {
     return this.routeCache;
   }
 
+  /**
+   * Whether the companion plugin's namespace is registered. Only a missing index
+   * means "no"; an unreachable site or rejected credentials is rethrown, so the
+   * caller reports the real failure instead of telling someone to install a
+   * plugin they already have.
+   */
   async hasHelperPlugin(): Promise<boolean> {
     try {
       const d = await this.discovery();
       return d.namespaces.includes(this.site.helperNamespace ?? "wpxmcp/v1");
-    } catch {
-      return false;
+    } catch (error) {
+      if (error instanceof WPError && error.status === 404) return false;
+      throw error;
     }
   }
 }

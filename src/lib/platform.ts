@@ -36,6 +36,15 @@ export interface Platform {
    * deployment, or a token issued by one will be rejected by another.
    */
   confirmSecret(): string;
+  /**
+   * Durable record of spent confirmation tokens, shared across isolates. Optional:
+   * without it, single use is enforced per process and the signature plus the
+   * ten-minute expiry are the protection.
+   */
+  spentTokens?: {
+    has(tokenHash: string): Promise<boolean>;
+    add(tokenHash: string, expiresAt: number): Promise<void>;
+  };
   /** Persisted user skills. Bundled skills are always available; saving needs a filesystem. */
   skills: {
     canSave: boolean;

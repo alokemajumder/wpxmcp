@@ -2,16 +2,70 @@ import { z } from "zod";
 import { defineTool, ok, siteIdSchema, trimText, type ToolContext } from "../lib/tooling.js";
 import { audit, inspectSql, enforceRowLimit, inspectCliCommand, CLI_ALLOWLIST, issueConfirmation, consumeConfirmation, fingerprintOp } from "../lib/safety.js";
 import type { WordPressClient } from "../lib/client.js";
+import { requireHelper } from "../lib/http-utils.js";
 
-async function requireHelper(client: WordPressClient, tool: string): Promise<string> {
-  const ns = client.site.helperNamespace ?? "wpxmcp/v1";
-  if (!(await client.hasHelperPlugin())) {
-    throw new Error(
-      `"${tool}" needs the wpxmcp companion plugin, which is not active on "${client.site.id}". Core WordPress exposes no REST route for this. Install wp-plugin/wpxmcp-helper from this repo: zip the folder, upload it under Plugins → Add New → Upload Plugin, activate it, then run test_site to confirm the ${ns} namespace appears.`
-    );
+
+/**
+ * Splits a command line into positional args and --flags exactly the way the
+ * companion plugin's WPXMCP_CLI::parse_args does, quotes included.
+ */
+export function parseCliArgs(input: string): { args: string[]; flags: Record<string, string | true> } {
+  const args: string[] = [];
+  const flags: Record<string, string | true> = {};
+  const re = /(?:--([a-zA-Z0-9_-]+)(?:=(?:"([^"]*)"|'([^']*)'|(\S+)))?)|"([^"]*)"|'([^']*)'|(\S+)/g;
+  for (const m of String(input ?? "").matchAll(re)) {
+    if (m[1]) {
+      const value = m[2] || m[3] || m[4] || "";
+      flags[m[1]] = value === "" ? true : value;
+      continue;
+    }
+    const arg = m[5] || m[6] || m[7];
+    if (arg) args.push(arg);
   }
-  return ns;
+  return { args, flags };
 }
+
+/**
+ * Whether the plugin will treat a search-replace command as a dry run.
+ *
+ * A regex over the raw string is not enough: "--dry-run-x" passes a \b test,
+ * "--dry-run" inside quotes is a positional argument, and "--dry-run=0" is
+ * empty() in PHP — each of which would run the real replacement without a
+ * confirmation. This mirrors the plugin's parser and its `! empty()` check.
+ */
+export function isCliDryRun(command: string): boolean {
+  const { flags } = parseCliArgs(command);
+  const value = flags["dry-run"];
+  return value === true || (typeof value === "string" && value !== "" && value !== "0");
+}
+
+/**
+ * Options set_option refuses to write. The plugin independently blocks the
+ * URL/theme/plugin ones; these additionally cover privilege escalation
+ * (default_role, the roles table), wpxmcp's own guard state (writing the
+ * snippets option could switch a snippet on, bypassing the wp-admin-only
+ * activation rule; the audit log could be erased), salts, and core bookkeeping.
+ */
+export function protectedOptionReason(name: string, value?: unknown): string | undefined {
+  const n = String(name ?? "").trim();
+  const lower = n.toLowerCase();
+  const fixed = ["siteurl", "home", "active_plugins", "active_sitewide_plugins", "template", "stylesheet", "cron", "db_version", "initial_db_version", "db_upgraded", "recently_activated", "uninstall_plugins", "upload_path", "upload_url_path", "rewrite_rules"];
+  if (fixed.includes(lower)) return `"${n}" is protected — writing it directly can take the site down or lock you out. Use the dedicated tool (activate_theme, activate_plugin, update_site_settings, run_wp_cli "rewrite flush") or wp-admin.`;
+  if (/_user_roles$/.test(lower)) return `"${n}" holds every role's capabilities; writing it can grant administrator rights to any role. Manage roles in wp-admin or with a roles plugin.`;
+  if (lower.startsWith("wpxmcp_")) return `"${n}" is wpxmcp's own state (snippets, drafts, preview tokens, audit log). Writing it directly would bypass the guards those features enforce.`;
+  if (/^(auth|secure_auth|logged_in|nonce)_(key|salt)$/.test(lower)) return `"${n}" is a security salt; changing it logs every user out and is not something to do through an option write.`;
+  if (lower === "default_role") {
+    // The companion plugin refuses this option outright, so say so rather than suggest some values would work.
+    return `"default_role" decides the role every new registration receives, so the companion plugin refuses to write it${typeof value === "string" ? ` (asked for "${value}")` : ""}. Change it in Settings → General.`;
+  }
+  return undefined;
+}
+
+/** Ability names are "namespace/ability", matching core's route pattern. */
+const ABILITY_NAME = /^\s*[a-zA-Z0-9-]+(?:\/[a-zA-Z0-9-]+)+\s*$/;
+
+/** Snippet ids as the plugin generates them (sanitize_key output plus a hash). */
+const SNIPPET_ID = /^[a-zA-Z0-9_-]+$/;
 
 const FIELD_TYPES = [
   "text", "textarea", "wysiwyg", "number", "email", "url", "date",
@@ -68,7 +122,7 @@ export function powerTools(ctx: ToolContext) {
         const ns = await requireHelper(client, "run_wp_cli");
 
         // search-replace rewrites content across the database — always preview first.
-        const needsConfirmation = verdict.matched === "search-replace" && !/--dry-run\b/.test(command);
+        const needsConfirmation = verdict.matched === "search-replace" && !isCliDryRun(command);
         const fingerprint = fingerprintOp(["wp_cli", client.site.id, command]);
 
         if (needsConfirmation && !confirm_token) {
@@ -186,15 +240,21 @@ export function powerTools(ctx: ToolContext) {
             "This site does not expose the Abilities API — no plugin has registered abilities, or the plugins predate it. Use the plugin's own REST namespace (discover_rest_routes) or run_wp_cli instead.");
         }
 
-        // GET /wp-abilities/v1/abilities — the documented listing route.
-        const res = await client.get<any>(`/${abilityNs}/abilities`, { search, per_page: 100 });
-        const list = Array.isArray(res.data) ? res.data : res.data?.abilities ?? [];
+        // GET /wp-abilities/v1/abilities — the documented listing route. It
+        // paginates (per_page max 100) and has no search parameter, so walk the
+        // pages and filter here.
+        const all = await client.getAll<any>(`/${abilityNs}/abilities`, {}, 1000);
+        const q = search?.toLowerCase();
+        const list = q
+          ? all.filter((a: any) => [a.name, a.label, a.description, a.category].some((v) => String(v ?? "").toLowerCase().includes(q)))
+          : all;
         return ok({
-          site: client.site.id, namespace: abilityNs, count: list.length,
+          site: client.site.id, namespace: abilityNs, count: list.length, total_registered: all.length,
           abilities: list.map((a: any) => ({
             name: a.name ?? a.id, label: a.label ?? a.title,
             description: String(a.description ?? "").slice(0, 300),
             category: a.category, input_schema: a.input_schema ?? a.inputSchema,
+            annotations: a.meta?.annotations ?? a.annotations,
           })),
         }, "Call one with run_ability. Check its input_schema first so the arguments match.");
       },
@@ -208,7 +268,7 @@ export function powerTools(ctx: ToolContext) {
         "Get the full definition of one ability, including its input and output schemas and whether it is destructive, so you can call it correctly the first time. Ability names are namespaced, e.g. \"my-plugin/get-site-info\".",
       schema: {
         site_id: siteIdSchema,
-        name: z.string().describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
+        name: z.string().regex(ABILITY_NAME, "Ability names look like \"namespace/ability-name\".").describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
       },
       handler: async ({ site_id, name }) => {
         const client = site(site_id);
@@ -227,8 +287,8 @@ export function powerTools(ctx: ToolContext) {
         "Execute an ability registered through the WordPress Abilities API. This is the preferred way to write data a plugin owns — the plugin's own validation, hooks and cache invalidation all run, which raw SQL would bypass. Check get_ability_info for the input schema first. The Abilities API maps intent onto HTTP methods: read-only abilities use GET, ordinary ones POST, and destructive ones DELETE; this is chosen automatically unless you override it.",
       schema: {
         site_id: siteIdSchema,
-        name: z.string().describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
-        input: z.record(z.any()).optional().describe("Arguments matching the ability's input_schema."),
+        name: z.string().regex(ABILITY_NAME, "Ability names look like \"namespace/ability-name\".").describe("Fully qualified ability name from discover_abilities, in the form \"namespace/ability\"."),
+        input: z.record(z.string(), z.any()).optional().describe("Arguments matching the ability's input_schema."),
         method: z.enum(["auto", "GET", "POST", "DELETE"]).optional().default("auto")
           .describe("HTTP method. \"auto\" reads the ability's definition and picks GET for read-only, DELETE for destructive, POST otherwise."),
       },
@@ -272,7 +332,7 @@ export function powerTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         action: z.enum(["list", "get", "create", "update", "delete"]).describe("What to do."),
-        id: z.union([z.number().int(), z.string()]).optional().describe("Snippet id, for get/update/delete."),
+        id: z.union([z.number().int(), z.string().regex(SNIPPET_ID, "Snippet ids contain only letters, digits, hyphens and underscores.")]).optional().describe("Snippet id, for get/update/delete."),
         title: z.string().optional().describe("Snippet name, for create/update."),
         code: z.string().optional().describe("The snippet body. For PHP, omit the opening <?php tag."),
         language: z.enum(["php", "css", "js", "html"]).optional().describe("Snippet language, for create."),
@@ -290,7 +350,7 @@ export function powerTools(ctx: ToolContext) {
           return ok(res.data);
         }
         if (args.action === "get") {
-          if (!args.id) throw new Error("`id` is required for get.");
+          if (args.id === undefined || args.id === "") throw new Error("`id` is required for get.");
           const res = await client.get<any>(`/${ns}/snippets/${args.id}`);
           return ok(res.data);
         }
@@ -311,9 +371,13 @@ export function powerTools(ctx: ToolContext) {
           if (!args.id) throw new Error("`id` is required for update.");
           const body: Record<string, unknown> = {};
           for (const k of ["title", "code", "location", "description"] as const) if (args[k] !== undefined) body[k] = args[k];
+          if (Object.keys(body).length === 0) throw new Error("No fields to update were supplied.");
           const res = await client.post<any>(`/${ns}/snippets/${args.id}`, body);
           audit({ site: client.site.id, tool: "code_snippet", action: "update", target: args.id, outcome: "ok" });
-          return ok({ updated: true, ...res.data });
+          return ok({ updated: true, ...res.data },
+            res.data?.active && body.code !== undefined
+              ? "This snippet is ACTIVE, so the new code is already running on the live site. Check the front end and admin now."
+              : undefined);
         }
 
         if (!args.id) throw new Error("`id` is required for delete.");
@@ -333,7 +397,7 @@ export function powerTools(ctx: ToolContext) {
       name: "register_fields",
       title: "Register editable fields",
       description:
-        "Register custom fields that appear as native meta boxes in wp-admin (or as a settings page for site-wide options), and are automatically exposed to the REST API so they can be read and written afterwards. Use this when building a theme so the site stays editable by humans without touching code. Values are stored as ordinary post meta or options, so the data survives even if this tooling is removed. Thirteen field types are supported: text, textarea, wysiwyg, number, email, url, date, select, checkbox, radio, color, image, gallery, repeater.",
+        "Register custom fields that appear as native meta boxes in wp-admin (or as a settings page for site-wide options), and are automatically exposed to the REST API so they can be read and written afterwards. Use this when building a theme so the site stays editable by humans without touching code. Values are stored as ordinary post meta or options, so the data survives even if this tooling is removed. Fourteen field types are supported: text, textarea, wysiwyg, number, email, url, date, select, checkbox, radio, color, image, gallery, repeater.",
       schema: {
         site_id: siteIdSchema,
         group_key: z.string().describe("Unique key for this field group, e.g. \"homepage_hero\"."),
@@ -348,10 +412,13 @@ export function powerTools(ctx: ToolContext) {
           label: z.string().describe("Label shown to the editor."),
           type: z.enum(FIELD_TYPES).describe("Field type."),
           description: z.string().optional().describe("Help text beneath the field."),
-          default: z.any().optional(),
-          required: z.boolean().optional(),
-          placeholder: z.string().optional(),
-          choices: z.array(z.object({ value: z.string(), label: z.string() })).optional()
+          default: z.any().optional().describe("Value used when nothing has been saved yet."),
+          required: z.boolean().optional().describe("Whether the editor must fill this field in."),
+          placeholder: z.string().optional().describe("Placeholder text shown in an empty input."),
+          choices: z.array(z.object({
+            value: z.string().describe("Stored value."),
+            label: z.string().describe("Label shown to the editor."),
+          })).optional()
             .describe("Options for select, radio and checkbox fields."),
           min: z.number().optional().describe("Minimum, for number fields."),
           max: z.number().optional().describe("Maximum, for number fields."),
@@ -443,6 +510,11 @@ export function powerTools(ctx: ToolContext) {
       handler: async ({ site_id, name, value, autoload }) => {
         const client = site(site_id);
         client.assertWritable("set_option");
+        const refusal = protectedOptionReason(name, value);
+        if (refusal) {
+          audit({ site: client.site.id, tool: "set_option", action: "write", target: name, outcome: "refused", detail: refusal });
+          return ok({ updated: false, refused: true, name, reason: refusal }, "The option was not written.");
+        }
         const ns = await requireHelper(client, "set_option");
         const before = await client.get<any>(`/${ns}/options`, { names: name }).catch(() => null);
         const res = await client.post<any>(`/${ns}/options`, { name, value, autoload });

@@ -33,6 +33,13 @@ class WPXMCP_Snippets {
 	const OPTION = 'wpxmcp_snippets';
 
 	/**
+	 * The PHP snippet currently being evaluated, for the fatal-error handler.
+	 *
+	 * @var string|null
+	 */
+	private static $running = null;
+
+	/**
 	 * Accessor.
 	 *
 	 * @return WPXMCP_Snippets
@@ -211,13 +218,20 @@ class WPXMCP_Snippets {
 			return new WP_Error( 'wpxmcp_no_snippet', sprintf( 'No snippet "%s".', $id ), array( 'status' => 404 ) );
 		}
 
-		$code = $request->get_param( 'code' );
+		$code        = $request->get_param( 'code' );
+		$deactivated = false;
 		if ( null !== $code ) {
 			if ( 'php' === $snippets[ $id ]['language'] ) {
 				$check = $this->check_php( (string) $code );
 				if ( is_wp_error( $check ) ) {
 					return $check;
 				}
+			}
+			if ( (string) $code !== $snippets[ $id ]['code'] && ! empty( $snippets[ $id ]['active'] ) ) {
+				// A human approved the old code, not this code. Changing an active
+				// snippet would otherwise run unreviewed code on the next request.
+				$snippets[ $id ]['active'] = false;
+				$deactivated               = true;
 			}
 			$snippets[ $id ]['code'] = (string) $code;
 		}
@@ -236,12 +250,16 @@ class WPXMCP_Snippets {
 
 		$snippets[ $id ]['updated'] = gmdate( 'c' );
 		update_option( self::OPTION, $snippets );
-		wpxmcp_audit( 'snippet update', array( 'id' => $id ) );
+		wpxmcp_audit( 'snippet update', array( 'id' => $id, 'deactivated' => $deactivated ) );
 
 		return array_merge(
 			array( 'id' => $id, 'updated' => true ),
 			$snippets[ $id ],
-			array( 'note' => 'Activation state is unchanged — snippets can only be enabled from wp-admin.' )
+			array(
+				'note' => $deactivated
+					? 'The code changed, so the snippet was DISABLED and is no longer running. Review the new code in wp-admin (Tools → Code Snippets) and re-activate it there.'
+					: 'Activation state is unchanged — snippets can only be enabled from wp-admin.',
+			)
 		);
 	}
 
@@ -293,9 +311,24 @@ class WPXMCP_Snippets {
 	 * Execute active PHP snippets.
 	 */
 	public function run_php_snippets() {
+		// Escape hatch for a snippet that takes the whole site down:
+		// define( 'WPXMCP_SAFE_MODE', true ); in wp-config.php skips every snippet.
+		if ( defined( 'WPXMCP_SAFE_MODE' ) && WPXMCP_SAFE_MODE ) {
+			return;
+		}
+
+		$registered = false;
+
 		foreach ( self::all() as $id => $snippet ) {
-			if ( empty( $snippet['active'] ) || 'php' !== $snippet['language'] ) {
+			if ( empty( $snippet['active'] ) || empty( $snippet['language'] ) || 'php' !== $snippet['language'] || ! isset( $snippet['code'] ) ) {
 				continue;
+			}
+			if ( ! $registered ) {
+				// Fatal errors (redeclared functions, memory exhaustion) are not
+				// Throwables; catch them on the way out and disable the culprit so the
+				// next request — and wp-admin — loads.
+				register_shutdown_function( array( __CLASS__, 'disable_on_fatal' ) );
+				$registered = true;
 			}
 			if ( 'admin' === $snippet['location'] && ! is_admin() ) {
 				continue;
@@ -305,9 +338,12 @@ class WPXMCP_Snippets {
 			}
 
 			try {
+				self::$running = $id;
 				// phpcs:ignore Squiz.PHP.Eval.Discouraged
 				eval( preg_replace( '/^\s*<\?php/', '', $snippet['code'] ) );
+				self::$running = null;
 			} catch ( Throwable $e ) {
+				self::$running = null;
 				// A broken snippet disables itself rather than fataling every request.
 				$snippets                       = self::all();
 				$snippets[ $id ]['active']      = false;
@@ -318,6 +354,27 @@ class WPXMCP_Snippets {
 					error_log( sprintf( '[wpxmcp] Snippet "%s" threw and was disabled: %s', $id, $e->getMessage() ) ); // phpcs:ignore
 				}
 			}
+		}
+	}
+
+	/**
+	 * Shutdown handler: disable the snippet that was executing when PHP fataled.
+	 */
+	public static function disable_on_fatal() {
+		if ( null === self::$running ) {
+			return;
+		}
+		$error = error_get_last();
+		if ( ! $error || ! in_array( $error['type'], array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR ), true ) ) {
+			return;
+		}
+
+		$id       = self::$running;
+		$snippets = self::all();
+		if ( isset( $snippets[ $id ] ) ) {
+			$snippets[ $id ]['active']     = false;
+			$snippets[ $id ]['last_error'] = $error['message'];
+			update_option( self::OPTION, $snippets );
 		}
 	}
 
@@ -345,10 +402,15 @@ class WPXMCP_Snippets {
 			if ( empty( $snippet['active'] ) || ! in_array( $snippet['location'], $locations, true ) ) {
 				continue;
 			}
+			if ( ! isset( $snippet['language'], $snippet['code'] ) ) {
+				continue;
+			}
 			if ( 'css' === $snippet['language'] ) {
 				echo "\n<style id=\"wpxmcp-snippet\">\n" . wp_strip_all_tags( $snippet['code'] ) . "\n</style>\n"; // phpcs:ignore WordPress.Security.EscapeOutput
 			} elseif ( 'js' === $snippet['language'] ) {
 				echo "\n<script id=\"wpxmcp-snippet\">\n" . $snippet['code'] . "\n</script>\n"; // phpcs:ignore WordPress.Security.EscapeOutput
+			} elseif ( 'html' === $snippet['language'] ) {
+				echo "\n" . $snippet['code'] . "\n"; // phpcs:ignore WordPress.Security.EscapeOutput
 			}
 		}
 	}
@@ -381,7 +443,12 @@ class WPXMCP_Snippets {
 			$snippets = self::all();
 
 			foreach ( $snippets as $id => $snippet ) {
-				$snippets[ $id ]['active'] = in_array( $id, $active, true );
+				$now_active = in_array( (string) $id, $active, true );
+				if ( $now_active && empty( $snippet['active'] ) ) {
+					// Re-enabled after review: the old failure no longer applies.
+					unset( $snippets[ $id ]['last_error'] );
+				}
+				$snippets[ $id ]['active'] = $now_active;
 			}
 			update_option( self::OPTION, $snippets );
 			wpxmcp_audit( 'snippet activation changed', array( 'active' => $active ) );

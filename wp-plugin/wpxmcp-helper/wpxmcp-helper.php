@@ -1,9 +1,9 @@
 <?php
 /**
  * Plugin Name:       wpxmcp Helper
- * Plugin URI:        https://github.com/wpxmcp
- * Description:       Companion plugin for the wpxmcp MCP server. Exposes the things core REST does not: emulated WP-CLI, read-only SQL, theme files and sandboxed drafts, unregistered post meta, options, theme mods, site health, code snippets and editable fields.
- * Version:           1.0.0
+ * Plugin URI:        https://github.com/alokemajumder/wpxmcp
+ * Description:       Companion plugin for the wpxmcp MCP server. Exposes the things core REST does not: emulated WP-CLI, guarded SQL, theme files and sandboxed drafts, error logs and cache purges, request profiling, developer introspection, plugin settings and admin screens, unregistered post meta, options, snippets and editable fields.
+ * Version:           2.0.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            wpxmcp
@@ -18,14 +18,15 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'WPXMCP_VERSION', '1.0.0' );
+define( 'WPXMCP_VERSION', '2.0.0' );
 define( 'WPXMCP_NAMESPACE', 'wpxmcp/v1' );
 define( 'WPXMCP_FILE', __FILE__ );
 define( 'WPXMCP_DIR', plugin_dir_path( __FILE__ ) );
 
 /**
- * Every mutating route requires this capability. Read routes require edit_posts
- * or better, checked per route.
+ * Every route requires this capability (a network super admin on multisite).
+ * Routes that change files or themes additionally check the specific capability,
+ * so DISALLOW_FILE_EDIT and DISALLOW_FILE_MODS are honoured.
  */
 define( 'WPXMCP_ADMIN_CAP', 'manage_options' );
 
@@ -34,6 +35,10 @@ require_once WPXMCP_DIR . 'includes/class-wpxmcp-cli.php';
 require_once WPXMCP_DIR . 'includes/class-wpxmcp-themes.php';
 require_once WPXMCP_DIR . 'includes/class-wpxmcp-fields.php';
 require_once WPXMCP_DIR . 'includes/class-wpxmcp-snippets.php';
+require_once WPXMCP_DIR . 'includes/class-wpxmcp-diagnostics.php';
+require_once WPXMCP_DIR . 'includes/class-wpxmcp-inspect.php';
+require_once WPXMCP_DIR . 'includes/class-wpxmcp-profiler.php';
+require_once WPXMCP_DIR . 'includes/class-wpxmcp-admin.php';
 
 /**
  * Boot.
@@ -43,8 +48,50 @@ function wpxmcp_init() {
 	WPXMCP_Themes::instance();
 	WPXMCP_Fields::instance();
 	WPXMCP_Snippets::instance();
+	WPXMCP_Diagnostics::instance();
+	WPXMCP_Inspect::instance();
+	WPXMCP_Profiler::instance();
+	WPXMCP_Admin::instance();
 }
 add_action( 'plugins_loaded', 'wpxmcp_init' );
+
+/**
+ * Options no wpxmcp write path may touch: the ones that lock the site out or
+ * break this connection, and the plugin's own state — writing wpxmcp_snippets
+ * directly would activate PHP without the wp-admin review step, and the audit
+ * log is meant to be append-only.
+ *
+ * @param string $name Option name.
+ * @return bool
+ */
+function wpxmcp_is_protected_option( $name ) {
+	// MySQL compares option names case-insensitively and ignores trailing spaces.
+	$name = strtolower( trim( (string) $name ) );
+
+	$protected = array(
+		// Lock-out or broken connection.
+		'siteurl', 'home', 'active_plugins', 'active_sitewide_plugins', 'template', 'stylesheet',
+		// Core state that is regenerated or migrated by WordPress itself.
+		'cron', 'db_version', 'rewrite_rules',
+		// Where uploads are written — pointing it elsewhere writes files outside wp-content.
+		'upload_path', 'upload_url_path',
+		// Privilege: the role every new account receives.
+		'default_role',
+	);
+	if ( in_array( $name, $protected, true ) ) {
+		return true;
+	}
+
+	// Role definitions ({prefix}user_roles) and salts stored as options.
+	if ( '_user_roles' === substr( $name, -11 ) ) {
+		return true;
+	}
+	if ( preg_match( '/^(auth|secure_auth|logged_in|nonce)_(key|salt)$/', $name ) ) {
+		return true;
+	}
+
+	return 0 === strpos( $name, 'wpxmcp_' );
+}
 
 /**
  * Append-only audit trail of every sensitive action, mirrored site-side so it

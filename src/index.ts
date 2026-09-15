@@ -1,15 +1,13 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { installNodePlatform } from "./platform-node.js";
 import { SiteRegistry } from "./lib/registry.js";
-import { registerTools, type ToolContext } from "./lib/tooling.js";
+import type { ToolContext } from "./lib/tooling.js";
+import { createWpxServer } from "./lib/server.js";
 import { loadConfig } from "./lib/config.js";
 import { listSkills } from "./lib/skills.js";
 
-import { buildToolset, VERSION, INSTRUCTIONS } from "./toolset.js";
-
-
+import { buildToolset, VERSION } from "./toolset.js";
 
 async function main() {
   installNodePlatform();
@@ -26,14 +24,7 @@ async function main() {
   const registry = new SiteRegistry();
   const ctx: ToolContext = { registry };
 
-  const server = new McpServer(
-    { name: "wpxmcp", version: VERSION },
-    { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
-  );
-
   const tools = buildToolset(ctx);
-
-  registerTools(server, tools);
 
   // stdout is the MCP transport — everything diagnostic must go to stderr.
   console.error(
@@ -41,8 +32,11 @@ async function main() {
       (registry.sites.length ? `: ${registry.sites.map((s) => s.id).join(", ")}` : " (none configured — run list_sites for setup help)")
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Serves both protocol eras: the opening message pins the connection to
+  // 2026-07-28 (server/discover) or to a 2025-era initialize handshake.
+  serveStdio(() => createWpxServer(ctx, tools), {
+    onerror: (error) => console.error(`wpxmcp: ${error.message}`),
+  });
 }
 
 /** `wpxmcp --doctor` — verifies configuration and connectivity outside an MCP client. */
@@ -72,6 +66,9 @@ async function doctor() {
   const registry = new SiteRegistry(config);
   for (const site of config.sites) {
     console.log(`── ${site.id} (${site.url})`);
+    if (site.url.startsWith("http://") && site.username && site.appPassword) {
+      console.log("   ○ plain http — WordPress only accepts Application Passwords over HTTPS (or on a local environment)");
+    }
     const client = registry.resolve(site.id);
     try {
       const root = await client.get<any>("/");

@@ -32,6 +32,9 @@ export function installNodePlatform(): Platform {
   const memory = createMemoryAudit();
   const auditFile = () => path.join(ensureHome(), "audit.log.jsonl");
   const savedSkillsDir = () => path.join(ensureHome(), "skills");
+  // Computed without creating anything: installing the platform must not fail
+  // (and the server must still start) when the home directory is read-only.
+  const savedSkillsPath = path.join(WPX_HOME, "skills");
 
   const runtime: Platform = {
     kind: "node",
@@ -49,7 +52,7 @@ export function installNodePlatform(): Platform {
     },
 
     readAudit(limit: number, site?: string): AuditEntry[] {
-      const file = auditFile();
+      const file = path.join(WPX_HOME, "audit.log.jsonl");
       if (!fs.existsSync(file)) return memory.read(limit, site);
       let lines: string[];
       try {
@@ -70,7 +73,7 @@ export function installNodePlatform(): Platform {
     },
 
     readLocalFile(filePath: string) {
-      const resolved = filePath.startsWith("~")
+      const resolved = filePath === "~" || filePath.startsWith("~/")
         ? path.join(os.homedir(), filePath.slice(1))
         : path.resolve(filePath);
 
@@ -91,13 +94,28 @@ export function installNodePlatform(): Platform {
 
     confirmSecret() {
       // Persisted so a token issued before a restart still verifies afterwards.
-      const file = path.join(ensureHome(), "confirm.key");
       try {
-        if (fs.existsSync(file)) return fs.readFileSync(file, "utf8").trim();
+        const file = path.join(ensureHome(), "confirm.key");
+        if (fs.existsSync(file)) {
+          const existing = fs.readFileSync(file, "utf8").trim();
+          if (existing.length >= 32) return existing;
+          // An empty or truncated key would sign tokens anyone could forge, so it
+          // is never trusted. A fresh one may be another process mid-write.
+          if (Date.now() - fs.statSync(file).mtimeMs < 5000) return processKey();
+          fs.unlinkSync(file);
+        }
         const bytes = new Uint8Array(32);
         crypto.getRandomValues(bytes);
         const key = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-        fs.writeFileSync(file, key, { mode: 0o600 });
+        try {
+          // "wx": when two servers start together, the first key written wins and
+          // both use it, instead of the second overwriting the first's key.
+          fs.writeFileSync(file, key, { mode: 0o600, flag: "wx" });
+        } catch (e: any) {
+          if (e?.code !== "EEXIST") throw e;
+          const winner = fs.readFileSync(file, "utf8").trim();
+          return winner.length >= 32 ? winner : processKey();
+        }
         return key;
       } catch {
         // Read-only home directory: fall back to a per-process key. Tokens then
@@ -108,10 +126,10 @@ export function installNodePlatform(): Platform {
 
     skills: {
       canSave: true,
-      savedDir: savedSkillsDir(),
+      savedDir: savedSkillsPath,
 
       listSaved() {
-        const dir = savedSkillsDir();
+        const dir = savedSkillsPath;
         if (!fs.existsSync(dir)) return [];
         return fs
           .readdirSync(dir)
@@ -128,7 +146,7 @@ export function installNodePlatform(): Platform {
       },
 
       remove(name: string) {
-        const file = path.join(savedSkillsDir(), `${name}.md`);
+        const file = path.join(savedSkillsPath, `${name}.md`);
         if (!fs.existsSync(file)) return false;
         fs.unlinkSync(file);
         return true;

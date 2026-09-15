@@ -68,8 +68,9 @@ class WPXMCP_Themes {
 	 * Routes.
 	 */
 	public function register_routes() {
-		$ns    = WPXMCP_NAMESPACE;
-		$admin = array( WPXMCP_REST::instance(), 'require_admin' );
+		$ns     = WPXMCP_NAMESPACE;
+		$admin  = array( WPXMCP_REST::instance(), 'require_admin' );
+		$editor = array( $this, 'require_theme_editor' );
 
 		register_rest_route( $ns, '/themes/files', array(
 			'methods'             => WP_REST_Server::READABLE,
@@ -86,12 +87,12 @@ class WPXMCP_Themes {
 			array(
 				'methods'             => WP_REST_Server::CREATABLE,
 				'callback'            => array( $this, 'write_file' ),
-				'permission_callback' => $admin,
+				'permission_callback' => $editor,
 			),
 			array(
 				'methods'             => WP_REST_Server::DELETABLE,
 				'callback'            => array( $this, 'delete_file' ),
-				'permission_callback' => $admin,
+				'permission_callback' => $editor,
 			),
 		) );
 
@@ -99,12 +100,12 @@ class WPXMCP_Themes {
 			array(
 				'methods'             => WP_REST_Server::CREATABLE,
 				'callback'            => array( $this, 'create_draft' ),
-				'permission_callback' => $admin,
+				'permission_callback' => $editor,
 			),
 			array(
 				'methods'             => WP_REST_Server::DELETABLE,
 				'callback'            => array( $this, 'delete_draft' ),
-				'permission_callback' => $admin,
+				'permission_callback' => $editor,
 			),
 		) );
 
@@ -117,7 +118,7 @@ class WPXMCP_Themes {
 		register_rest_route( $ns, '/themes/scaffold', array(
 			'methods'             => WP_REST_Server::CREATABLE,
 			'callback'            => array( $this, 'scaffold' ),
-			'permission_callback' => $admin,
+			'permission_callback' => $editor,
 		) );
 
 		register_rest_route( $ns, '/themes/preview-url', array(
@@ -129,7 +130,7 @@ class WPXMCP_Themes {
 		register_rest_route( $ns, '/themes/publish', array(
 			'methods'             => WP_REST_Server::CREATABLE,
 			'callback'            => array( $this, 'publish_draft' ),
-			'permission_callback' => $admin,
+			'permission_callback' => $editor,
 		) );
 
 		register_rest_route( $ns, '/themes/activate', array(
@@ -145,9 +146,75 @@ class WPXMCP_Themes {
 		) );
 	}
 
+	/**
+	 * Writing theme files is code editing, so it honours the same switch core's
+	 * theme editor does: DISALLOW_FILE_EDIT / DISALLOW_FILE_MODS remove
+	 * edit_themes, and so does a multisite role below super admin.
+	 *
+	 * @return true|WP_Error
+	 */
+	public function require_theme_editor() {
+		$admin = WPXMCP_REST::instance()->require_admin();
+		if ( is_wp_error( $admin ) ) {
+			return $admin;
+		}
+		if ( ! current_user_can( 'edit_themes' ) ) {
+			return new WP_Error(
+				'wpxmcp_file_edit_disabled',
+				'Theme file changes are disabled on this site: WordPress withholds the edit_themes capability, usually because DISALLOW_FILE_EDIT or DISALLOW_FILE_MODS is set in wp-config.php.',
+				array( 'status' => 403 )
+			);
+		}
+		return true;
+	}
+
 	/* ------------------------------------------------------------------ *
 	 * Path safety
 	 * ------------------------------------------------------------------ */
+
+	/**
+	 * Whether a theme directory name is a plain, single path segment.
+	 *
+	 * basename() alone lets "." and ".." through, which resolve to the themes
+	 * root and wp-content respectively.
+	 *
+	 * @param string $theme Theme directory name.
+	 * @return bool
+	 */
+	private function is_valid_slug( $theme ) {
+		$theme = (string) $theme;
+		return '' !== $theme
+			&& '.' !== $theme
+			&& '..' !== $theme
+			&& false === strpbrk( $theme, "/\\\0" );
+	}
+
+	/**
+	 * Whether $path is $root or inside it, after both are resolved.
+	 *
+	 * Walks up to the nearest existing ancestor so a not-yet-created
+	 * subdirectory below a symlink cannot escape the check.
+	 *
+	 * @param string $root Absolute directory.
+	 * @param string $path Absolute path, which need not exist yet.
+	 * @return bool
+	 */
+	private function is_inside( $root, $path ) {
+		$real_root = realpath( $root );
+		if ( false === $real_root ) {
+			return false;
+		}
+		$probe = $path;
+		while ( false === realpath( $probe ) ) {
+			$parent = dirname( $probe );
+			if ( $parent === $probe ) {
+				return false;
+			}
+			$probe = $parent;
+		}
+		$real = realpath( $probe );
+		return $real === $real_root || 0 === strpos( $real, trailingslashit( $real_root ) );
+	}
 
 	/**
 	 * Resolves the theme to operate on.
@@ -183,8 +250,11 @@ class WPXMCP_Themes {
 	 * @return string|WP_Error
 	 */
 	private function resolve_path( $theme, $relative, $require_file = false ) {
-		$theme = basename( $theme );
-		$root  = trailingslashit( get_theme_root() ) . $theme;
+		$theme = basename( (string) $theme );
+		if ( ! $this->is_valid_slug( $theme ) ) {
+			return new WP_Error( 'wpxmcp_bad_theme', 'Supply a theme directory name.', array( 'status' => 400 ) );
+		}
+		$root = trailingslashit( get_theme_root() ) . $theme;
 
 		if ( ! is_dir( $root ) ) {
 			return new WP_Error( 'wpxmcp_no_theme', sprintf( 'No theme directory "%s".', $theme ), array( 'status' => 404 ) );
@@ -195,7 +265,9 @@ class WPXMCP_Themes {
 		if ( '' === $relative ) {
 			return new WP_Error( 'wpxmcp_no_path', 'Supply a `path` relative to the theme root.', array( 'status' => 400 ) );
 		}
-		if ( false !== strpos( $relative, '..' ) || 0 === strpos( $relative, '/' ) ) {
+		// Null bytes make PHP 8 filesystem functions throw rather than return false;
+		// a drive letter or stream wrapper ("C:", "phar:") is never theme-relative.
+		if ( false !== strpos( $relative, "\0" ) || false !== strpos( $relative, ':' ) || false !== strpos( $relative, '..' ) ) {
 			return new WP_Error( 'wpxmcp_path_traversal', 'Paths must stay inside the theme directory — "..", absolute paths and symlink escapes are refused.', array( 'status' => 400 ) );
 		}
 
@@ -210,10 +282,9 @@ class WPXMCP_Themes {
 
 		$full = $root . '/' . $relative;
 
-		// Resolve symlinks and confirm the result is still inside the theme.
-		$real_root = realpath( $root );
-		$real_dir  = realpath( dirname( $full ) );
-		if ( $real_dir && $real_root && 0 !== strpos( $real_dir, $real_root ) ) {
+		// Resolve symlinks — on the file itself and on its nearest existing
+		// ancestor — and confirm the result is still inside the theme.
+		if ( ! $this->is_inside( $root, $full ) ) {
 			return new WP_Error( 'wpxmcp_path_escape', 'That path resolves outside the theme directory.', array( 'status' => 400 ) );
 		}
 
@@ -246,17 +317,23 @@ class WPXMCP_Themes {
 	 */
 	public function list_files( $request ) {
 		$theme  = basename( $this->resolve_theme( $request ) );
-		$subdir = trim( (string) $request->get_param( 'subdir' ), '/' );
+		$subdir = trim( str_replace( '\\', '/', (string) $request->get_param( 'subdir' ) ), '/' );
 		$root   = trailingslashit( get_theme_root() ) . $theme;
 
+		if ( ! $this->is_valid_slug( $theme ) ) {
+			return new WP_Error( 'wpxmcp_bad_theme', 'Supply a theme directory name.', array( 'status' => 400 ) );
+		}
 		if ( ! is_dir( $root ) ) {
 			return new WP_Error( 'wpxmcp_no_theme', sprintf( 'No theme directory "%s".', $theme ), array( 'status' => 404 ) );
 		}
-		if ( false !== strpos( $subdir, '..' ) ) {
+		if ( false !== strpos( $subdir, '..' ) || false !== strpos( $subdir, "\0" ) || false !== strpos( $subdir, ':' ) ) {
 			return new WP_Error( 'wpxmcp_path_traversal', 'Invalid subdir.', array( 'status' => 400 ) );
 		}
 
-		$base  = $subdir ? $root . '/' . $subdir : $root;
+		$base = $subdir ? $root . '/' . $subdir : $root;
+		if ( ! $this->is_inside( $root, $base ) ) {
+			return new WP_Error( 'wpxmcp_path_escape', 'That subdir resolves outside the theme directory.', array( 'status' => 400 ) );
+		}
 		$files = array();
 
 		if ( is_dir( $base ) ) {
@@ -311,12 +388,31 @@ class WPXMCP_Themes {
 			return $path;
 		}
 
+		if ( ! is_file( $path ) ) {
+			return new WP_Error( 'wpxmcp_no_file', 'That path is a directory, not a file.', array( 'status' => 400 ) );
+		}
+
+		$bytes = filesize( $path );
+		if ( $bytes > 5 * MB_IN_BYTES ) {
+			return new WP_Error( 'wpxmcp_file_too_large', sprintf( 'The file is %s — too large to return over REST.', size_format( $bytes ) ), array( 'status' => 413 ) );
+		}
+
+		$content  = file_get_contents( $path ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		$encoding = 'utf-8';
+		// Binary files (images, fonts) are not valid UTF-8, and JSON-encoding the
+		// raw bytes fails, which turns the whole response into an error.
+		if ( false !== $content && ! wp_check_invalid_utf8( $content ) && '' !== $content ) {
+			$content  = base64_encode( $content ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
+			$encoding = 'base64';
+		}
+
 		return array(
 			'theme'    => $theme,
 			'path'     => (string) $request->get_param( 'path' ),
-			'bytes'    => filesize( $path ),
+			'bytes'    => $bytes,
 			'modified' => gmdate( 'c', filemtime( $path ) ),
-			'content'  => file_get_contents( $path ), // phpcs:ignore WordPress.WP.AlternativeFunctions
+			'encoding' => $encoding,
+			'content'  => $content,
 		);
 	}
 
@@ -330,7 +426,8 @@ class WPXMCP_Themes {
 		$theme      = basename( $this->resolve_theme( $request ) );
 		$relative   = (string) $request->get_param( 'path' );
 		$content    = (string) $request->get_param( 'content' );
-		$allow_live = (bool) $request->get_param( 'allow_live' );
+		// rest_sanitize_boolean, not a cast: from a query string "false" casts to true.
+		$allow_live = rest_sanitize_boolean( $request->get_param( 'allow_live' ) );
 
 		if ( $this->is_live( $theme ) && ! $allow_live ) {
 			return new WP_Error(
@@ -383,7 +480,10 @@ class WPXMCP_Themes {
 	 * @return true|WP_Error
 	 */
 	private function check_php_syntax( $content ) {
-		$source = ( 0 === strpos( ltrim( $content ), '<?php' ) ) ? $content : "<?php\n" . $content;
+		// A theme file is included, so it starts in HTML mode exactly as written.
+		// Prefixing "<?php" would parse a template that opens with markup
+		// (header.php starting with <!DOCTYPE html>) as PHP and reject it.
+		$source = (string) $content;
 
 		// token_get_all raises a ParseError on invalid syntax under PHP 7+.
 		try {
@@ -412,7 +512,7 @@ class WPXMCP_Themes {
 	public function delete_file( $request ) {
 		$theme      = basename( $this->resolve_theme( $request ) );
 		$relative   = (string) $request->get_param( 'path' );
-		$allow_live = (bool) $request->get_param( 'allow_live' );
+		$allow_live = rest_sanitize_boolean( $request->get_param( 'allow_live' ) );
 
 		if ( $this->is_live( $theme ) && ! $allow_live ) {
 			return new WP_Error( 'wpxmcp_live_theme', sprintf( '"%s" is the live theme; refusing to delete from it. Work in a draft.', $theme ), array( 'status' => 409 ) );
@@ -421,6 +521,9 @@ class WPXMCP_Themes {
 		$path = $this->resolve_path( $theme, $relative, true );
 		if ( is_wp_error( $path ) ) {
 			return $path;
+		}
+		if ( ! is_file( $path ) ) {
+			return new WP_Error( 'wpxmcp_no_file', 'That path is a directory, not a file.', array( 'status' => 400 ) );
 		}
 
 		wp_delete_file( $path );
@@ -443,7 +546,9 @@ class WPXMCP_Themes {
 		$drafts = array();
 		$meta   = get_option( 'wpxmcp_drafts', array() );
 
-		foreach ( (array) glob( $root . self::DRAFT_PREFIX . '*', GLOB_ONLYDIR ) as $dir ) {
+		$dirs   = glob( $root . self::DRAFT_PREFIX . '*', GLOB_ONLYDIR );
+
+		foreach ( ( $dirs ? $dirs : array() ) as $dir ) {
 			$slug     = basename( $dir );
 			$drafts[] = array(
 				'stylesheet' => $slug,
@@ -485,7 +590,7 @@ class WPXMCP_Themes {
 		$from = $from ? basename( $from ) : get_stylesheet();
 
 		$source = trailingslashit( get_theme_root() ) . $from;
-		if ( ! is_dir( $source ) ) {
+		if ( ! $this->is_valid_slug( $from ) || ! is_dir( $source ) ) {
 			return new WP_Error( 'wpxmcp_no_theme', sprintf( 'No theme "%s" is installed.', $from ), array( 'status' => 404 ) );
 		}
 
@@ -494,6 +599,9 @@ class WPXMCP_Themes {
 
 		$copied = $this->copy_tree( $source, $target );
 		if ( is_wp_error( $copied ) ) {
+			if ( is_dir( $target ) ) {
+				$this->delete_tree( $target );
+			}
 			return $copied;
 		}
 
@@ -501,9 +609,17 @@ class WPXMCP_Themes {
 		$style = $target . '/style.css';
 		if ( file_exists( $style ) ) {
 			$css  = file_get_contents( $style ); // phpcs:ignore WordPress.WP.AlternativeFunctions
-			$name = (string) $request->get_param( 'draft_name' );
+			// Single line, no comment terminator: the name lands inside the header.
+			$name = str_replace( '*/', '', sanitize_text_field( (string) $request->get_param( 'draft_name' ) ) );
 			$name = $name ? $name : wp_get_theme( $from )->get( 'Name' ) . ' (draft)';
-			$css  = preg_replace( '/^(\s*Theme Name:).*$/mi', '$1 ' . $name, $css, 1 );
+			$css  = preg_replace_callback(
+				'/^(\s*Theme Name:).*$/mi',
+				static function ( $m ) use ( $name ) {
+					return $m[1] . ' ' . $name;
+				},
+				$css,
+				1
+			);
 			file_put_contents( $style, $css ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		}
 
@@ -547,16 +663,23 @@ class WPXMCP_Themes {
 			if ( 0 === strpos( $relative, 'node_modules/' ) || 0 === strpos( $relative, '.git/' ) ) {
 				continue;
 			}
+			if ( $item->isLink() ) {
+				// A symlink could point anywhere, wp-config.php included; never copy through it.
+				continue;
+			}
 			if ( $item->isDir() ) {
 				wp_mkdir_p( $target . '/' . $relative );
 				continue;
 			}
-			if ( copy( $item->getPathname(), $target . '/' . $relative ) ) {
-				$count++;
+			// A partial copy is worse than none: publishing it would drop files
+			// from the live site, and a partial backup is not a backup.
+			if ( $count >= 5000 ) {
+				return new WP_Error( 'wpxmcp_theme_too_large', sprintf( '"%s" has more than 5000 files (excluding node_modules and .git), too many to copy in one request.', basename( $source ) ), array( 'status' => 413 ) );
 			}
-			if ( $count > 5000 ) {
-				break;
+			if ( ! copy( $item->getPathname(), $target . '/' . $relative ) ) {
+				return new WP_Error( 'wpxmcp_copy_failed', sprintf( 'Could not copy "%s". Check filesystem permissions and free space on wp-content/themes.', $relative ), array( 'status' => 500 ) );
 			}
+			$count++;
 		}
 
 		return $count;
@@ -610,7 +733,7 @@ class WPXMCP_Themes {
 		);
 		foreach ( $iterator as $item ) {
 			/** @var SplFileInfo $item */
-			if ( $item->isDir() ) {
+			if ( $item->isDir() && ! $item->isLink() ) {
 				rmdir( $item->getPathname() ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 			} else {
 				wp_delete_file( $item->getPathname() );
@@ -628,7 +751,7 @@ class WPXMCP_Themes {
 	public function scaffold( $request ) {
 		$slug     = sanitize_key( (string) $request->get_param( 'slug' ) );
 		$files    = $request->get_param( 'files' );
-		$as_draft = null === $request->get_param( 'as_draft' ) ? true : (bool) $request->get_param( 'as_draft' );
+		$as_draft = null === $request->get_param( 'as_draft' ) ? true : rest_sanitize_boolean( $request->get_param( 'as_draft' ) );
 
 		if ( '' === $slug ) {
 			return new WP_Error( 'wpxmcp_no_slug', 'Supply a theme `slug`.', array( 'status' => 400 ) );
@@ -702,7 +825,7 @@ class WPXMCP_Themes {
 		$path  = (string) $request->get_param( 'path' );
 		$path  = $path ? $path : '/';
 
-		if ( ! is_dir( trailingslashit( get_theme_root() ) . $theme ) ) {
+		if ( ! $this->is_valid_slug( $theme ) || ! is_dir( trailingslashit( get_theme_root() ) . $theme ) ) {
 			return new WP_Error( 'wpxmcp_no_theme', sprintf( 'No theme directory "%s".', $theme ), array( 'status' => 404 ) );
 		}
 
@@ -753,13 +876,13 @@ class WPXMCP_Themes {
 		$token  = sanitize_text_field( wp_unslash( $_GET['wpxmcp_preview'] ) );
 		$tokens = get_option( 'wpxmcp_preview_tokens', array() );
 
-		if ( ! isset( $tokens[ $token ] ) ) {
+		if ( ! is_array( $tokens ) || ! isset( $tokens[ $token ]['theme'], $tokens[ $token ]['expires'] ) ) {
 			return null;
 		}
 		if ( $tokens[ $token ]['expires'] < time() ) {
 			return null;
 		}
-		if ( ! is_dir( trailingslashit( get_theme_root() ) . $tokens[ $token ]['theme'] ) ) {
+		if ( ! $this->is_valid_slug( $tokens[ $token ]['theme'] ) || ! is_dir( trailingslashit( get_theme_root() ) . $tokens[ $token ]['theme'] ) ) {
 			return null;
 		}
 
@@ -817,21 +940,50 @@ class WPXMCP_Themes {
 		}
 		$theme = basename( $theme );
 
+		if ( 0 !== strpos( $theme, self::DRAFT_PREFIX ) ) {
+			return new WP_Error(
+				'wpxmcp_not_a_draft',
+				sprintf( '"%s" is not a wpxmcp draft. Only drafts are published through this endpoint; use activate_theme to switch to an installed theme.', $theme ),
+				array( 'status' => 400 )
+			);
+		}
+
 		$source = trailingslashit( get_theme_root() ) . $theme;
-		if ( ! is_dir( $source ) ) {
+		if ( ! $this->is_valid_slug( $theme ) || ! is_dir( $source ) ) {
 			return new WP_Error( 'wpxmcp_no_theme', sprintf( 'No theme directory "%s".', $theme ), array( 'status' => 404 ) );
+		}
+
+		// Switching to a theme with a broken header or a missing parent takes the
+		// front end down; refuse before anything is touched.
+		$candidate = wp_get_theme( $theme );
+		if ( ! $candidate->exists() || $candidate->errors() ) {
+			$reason = $candidate->errors() ? $candidate->errors()->get_error_message() : 'it has no valid style.css header';
+			return new WP_Error( 'wpxmcp_broken_theme', sprintf( 'Refusing to publish "%s": %s. Nothing was changed.', $theme, $reason ), array( 'status' => 400 ) );
 		}
 
 		$previous = get_stylesheet();
 		$backup   = self::BACKUP_PREFIX . $previous . '-' . gmdate( 'Ymd-His' );
 
-		$copied = $this->copy_tree( trailingslashit( get_theme_root() ) . $previous, trailingslashit( get_theme_root() ) . $backup );
+		$copied = $this->copy_tree( get_stylesheet_directory(), trailingslashit( get_theme_root() ) . $backup );
 		if ( is_wp_error( $copied ) ) {
+			if ( is_dir( trailingslashit( get_theme_root() ) . $backup ) ) {
+				$this->delete_tree( trailingslashit( get_theme_root() ) . $backup );
+			}
 			return new WP_Error(
 				'wpxmcp_backup_failed',
 				'Refusing to publish: the current theme could not be backed up first (' . $copied->get_error_message() . '). Nothing was changed.',
 				array( 'status' => 500 )
 			);
+		}
+
+		// Theme mods are stored per stylesheet, so the draft would go live with no
+		// logo, colours or menu locations. Carry the live theme's mods over when
+		// the draft has none of its own.
+		if ( false === get_option( 'theme_mods_' . $theme ) ) {
+			$mods = get_option( 'theme_mods_' . $previous );
+			if ( is_array( $mods ) ) {
+				update_option( 'theme_mods_' . $theme, $mods );
+			}
 		}
 
 		switch_theme( $theme );
@@ -862,6 +1014,10 @@ class WPXMCP_Themes {
 		}
 		if ( $theme->errors() ) {
 			return new WP_Error( 'wpxmcp_broken_theme', 'That theme reports errors and cannot be activated: ' . $theme->errors()->get_error_message(), array( 'status' => 400 ) );
+		}
+
+		if ( ! current_user_can( 'switch_themes' ) ) {
+			return new WP_Error( 'wpxmcp_forbidden', 'Switching themes requires the switch_themes capability.', array( 'status' => 403 ) );
 		}
 
 		$previous = get_stylesheet();
