@@ -1,69 +1,55 @@
 ---
 name: classic-theme
-title: Building classic PHP themes
-description: How to author classic PHP theme templates with Tailwind, using the draft workflow so the live site is never broken.
-keywords: theme, classic theme, php, template, tailwind, header, footer, functions.php, design, style, php template, template hierarchy
+title: Building or editing a classic PHP theme
+description: Use when building a classic PHP theme (for example with Tailwind) or editing PHP template files, using the draft workflow so the live site never breaks.
+keywords: classic theme, php theme, custom theme, build a theme, tailwind, php template, functions.php, header.php, footer.php, single.php, page template, template hierarchy, child theme, get_template_part, theme from scratch, starter theme
 ---
 
-## Why classic templates
+## When this applies
 
-Classic PHP templates styled with Tailwind utilities produce cleaner, more predictable output than generated block markup. The result is readable, diffable, and reviewable by a human. Use this for anything you are building from scratch.
+Creating a theme from scratch, or changing `.php` templates, `functions.php` or theme CSS of a classic (non-block) theme. Block themes: `theme-json`.
 
-## The workflow — never edit a live theme
+## Rules
 
-```
-create_draft_theme        →  an isolated copy; the live site is untouched
-write_theme_file / edit_theme_file  →  build in the draft
-get_preview_url           →  a private tokenised URL only you see
-get_page_html             →  verify the rendered output
-publish_draft_theme       →  goes live, previous theme backed up automatically
-```
+1. Never write to the live theme. `write_theme_file` refuses by default; keep `allow_live_theme` false and work in a draft.
+2. Escape all output: `esc_html()` text, `esc_attr()` attributes, `esc_url()` URLs, `wp_kses_post()` editor HTML.
+3. Prefix every function, class, handle and option with the theme slug; an unprefixed name collides and fatals.
+4. Enqueue assets in a `wp_enqueue_scripts` callback; call `wp_head()` before `</head>`, `wp_body_open()` after `<body>` and `wp_footer()` before `</body>`.
+5. Content an editor should change goes in posts, menus, widgets or registered fields (`editable-fields`), not hardcoded in templates.
+6. Before editing an existing theme's file, read it: `write_theme_file` replaces the whole file; `edit_theme_file` needs exact text.
 
-`create_classic_theme` scaffolds a complete starter (header, footer, index, single, page, archive, search, 404, comments, `template-parts/`, `theme.css`, Tailwind wiring) in one call. Start there rather than writing a theme from an empty directory.
+## Procedure
 
-## One source of truth for design
+1. New theme: `create_classic_theme` with `name` and `tokens` (`primary`, `accent`, `ink`, `surface`, `font_sans`, `font_serif`, `radius`). It creates a draft with header, footer, index, single, page, archive, search, 404, comments, `template-parts/`, `theme.css` tokens and Tailwind wiring.
+   Existing theme: `create_draft_theme` (clones the active theme), then `list_theme_files` with `theme: "{draft id}"`.
+2. Find the file that renders a URL: `get_template_for_url` with `url` returns the resolved file, whether a child theme supplies it, and the hierarchy tried. Create a more specific file to affect only that URL.
+3. Edit: `read_theme_file` with `theme` and `path`, then `edit_theme_file` with `theme`, `path` and `edits` (or `write_theme_file` for new files). PHP is syntax-checked before saving.
+4. Design tokens live in `theme.css` as custom properties mapped to Tailwind names in `functions.php`: `bg-surface`, `bg-surface-alt`, `text-ink`, `text-ink-muted`, `bg-primary`, `text-primary-contrast`, `border-border-token`, `rounded-theme`, `shadow-card`, `max-w-container`. Use these, not raw hex or arbitrary values.
+5. Register the fields the client will edit: `register_fields` (see `editable-fields`).
+6. `get_preview_url` with `theme: "{draft id}"` and `path`, then check pages with `get_page_html` with `url`, `mode: "summary"` and `preview_token`, and `check_accessibility` with `url` and `preview_token`.
+7. `backup_status`, then `publish_draft_theme` with `confirm: true`. Theme mods (logo, menu locations) are copied to the draft if it has none.
 
-Every color, font, radius and spacing value lives in `theme.css` as a CSS custom property. `functions.php` maps those onto Tailwind, so templates use semantic classes:
+## Verify
 
-```php
-<div class="rounded-theme border border-border-token bg-surface-alt p-6 text-ink">
-  <h2 class="text-2xl font-semibold">…</h2>
-  <p class="mt-2 text-ink-muted">…</p>
-</div>
-```
+- `get_page_html` on the live URLs after publishing; `get_template_for_url` confirms the new theme's file renders.
+- `tail_error_log` with `level: "warning"` and `since` set to the publish time shows no new warnings from the theme.
 
-**Never hardcode `#1d4ed8` or `rounded-lg` in a template.** Restyling then means editing one file, and the site stays coherent.
+## Report back
 
-## Template hierarchy — the parts worth remembering
+Give the preview URL before publishing, and after publishing the backup name returned; rollback is `activate_theme` with `stylesheet: "{previous}"` and `confirm: true`. Note that the scaffold loads Tailwind's Play CDN script, which compiles CSS in the browser and is meant for development; recommend a compiled stylesheet for a high-traffic production site.
 
-| Request | Template |
+## Reference: template hierarchy (most specific first)
+
+| Request | Candidates |
 | --- | --- |
-| Blog listing / fallback | `index.php` |
-| Single post | `single.php`, or `single-{posttype}.php` |
-| Single page | `page.php`, or `page-{slug}.php` |
-| Category / tag / CPT archive | `archive.php`, `category.php`, `archive-{posttype}.php` |
-| Search results | `search.php` |
-| Not found | `404.php` |
+| Front page | `front-page.php` → `home.php` (if blog) / page templates → `index.php` |
+| Blog posts index | `home.php` → `index.php` |
+| Single post / CPT | `single-{post_type}-{slug}.php` → `single-{post_type}.php` → `single.php` → `singular.php` → `index.php` |
+| Page | custom template → `page-{slug}.php` → `page-{id}.php` → `page.php` → `singular.php` → `index.php` |
+| Category | `category-{slug}.php` → `category-{id}.php` → `category.php` → `archive.php` → `index.php` |
+| Custom taxonomy | `taxonomy-{tax}-{term}.php` → `taxonomy-{tax}.php` → `taxonomy.php` → `archive.php` |
+| CPT archive | `archive-{post_type}.php` → `archive.php` → `index.php` |
+| Author / date | `author-{nicename}.php` → `author.php` / `date.php` → `archive.php` |
+| Search, 404 | `search.php`, `404.php` → `index.php` |
 
-Fragments go in `template-parts/` and are pulled in with `get_template_part( 'template-parts/card' )`.
-
-## Non-negotiables
-
-1. **Escape everything on output.** `esc_html()` for text, `esc_url()` for URLs, `esc_attr()` for attributes, `wp_kses_post()` for editor HTML. Never echo a variable raw.
-2. **Prefix every function** with the theme slug. `mytheme_setup()`, not `setup()` — an unprefixed function fatals the site when something else declares the same name.
-3. **Enqueue, do not inline.** Use `wp_enqueue_style` / `wp_enqueue_script` in a `wp_enqueue_scripts` action. Hardcoded `<link>` tags break caching plugins and child themes.
-4. **`wp_head()` and `wp_footer()` are mandatory.** Omitting them breaks the admin bar, plugins, and half the ecosystem.
-5. **Content belongs in the database, not in templates.** Anything an editor should be able to change goes in a post, a menu, a widget, or a registered field.
-
-## Keep it editable afterwards
-
-As you build, register the fields the client will need with `register_fields`. They render as native meta boxes in wp-admin and are exposed to REST automatically, so the site stays maintainable by a human who does not write PHP. See the `editable-fields` skill.
-
-## Verify before publishing
-
-```
-get_preview_url  → the draft's private URL
-get_page_html    → mode "summary" reports headings, meta tags, alt-text coverage
-```
-
-Then `publish_draft_theme` with `confirm: true`. The previous theme is backed up, so a bad publish is one `activate_theme` away from being undone.
+Child theme files override the parent's file of the same name; `functions.php` of both load (child first). Fragments load with `get_template_part( 'template-parts/card' )`.

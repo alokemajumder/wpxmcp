@@ -1,5 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 const SP = process.env.SP;
 export async function connect() {
@@ -8,7 +8,9 @@ export async function connect() {
     env: { ...process.env, WPX_SITES_FILE: `${SP}/sites.json`, WPX_HOME: `${SP}/wpxhome` },
     stderr: "ignore",
   });
-  const client = new Client({ name: "audit", version: "1" }, { capabilities: {} });
+  // WPX_AUDIT_ERA=legacy exercises the 2025-era handshake; the default probes for 2026-07-28.
+  const mode = process.env.WPX_AUDIT_ERA === "legacy" ? "legacy" : "auto";
+  const client = new Client({ name: "audit", version: "1" }, { versionNegotiation: { mode } });
   await client.connect(transport);
   return client;
 }

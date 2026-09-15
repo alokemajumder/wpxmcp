@@ -3,6 +3,7 @@ import { defineTool, ok, siteIdSchema, stripHtml, unwrap, type ToolContext } fro
 import { platform } from "../lib/platform.js";
 import { readLocalFile, guessMimeType, sanitizeFilename, type WordPressClient } from "../lib/client.js";
 import { audit } from "../lib/safety.js";
+import { resolveType } from "./content.js";
 
 function shapeMedia(m: any) {
   return {
@@ -28,39 +29,223 @@ function shapeMedia(m: any) {
 }
 
 const MAX_UPLOAD_BYTES = 128 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
 
 /** Base64 decode that works on both Node and Workers. */
 function decodeBase64(input: string): Uint8Array {
-  const binary = atob(input);
+  let binary: string;
+  try {
+    binary = atob(input);
+  } catch {
+    throw new Error("base64_data is not valid base64. Send the file bytes base64-encoded (a data: URI is fine), without truncation.");
+  }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
 
-async function fetchRemote(url: string, timeoutMs: number): Promise<{ data: Uint8Array; filename: string; contentType: string }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
+function safeDecode(value: string): string {
   try {
-    res = await fetch(url, { signal: controller.signal, redirect: "follow", headers: { "User-Agent": "wpxmcp/1.0" } });
-  } catch (e: any) {
-    throw new Error(`Could not download "${url}": ${e?.message ?? e}. Check the URL is publicly reachable from the machine running this MCP server.`);
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * True for addresses a server-side download must never reach: loopback,
+ * private, link-local (including cloud metadata), CGNAT, multicast, reserved.
+ */
+export function isPrivateAddress(address: string): boolean {
+  let ip = address.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
+  const mappedDotted = /^(?:0{0,4}:){0,4}:?(?:0{0,4}:)?ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip) ?? /^::(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (mappedDotted) ip = mappedDotted[1];
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(ip);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1], 16);
+    const lo = parseInt(mappedHex[2], 16);
+    ip = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+    const [a, b, c] = ip.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 192 && b === 0 && c === 0) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224;
+  }
+  if (ip.includes(":")) {
+    if (/^[0:]*$/.test(ip) || /^[0:]*:0*1$/.test(ip)) return true; // :: and ::1
+    const first = parseInt(ip.split(":")[0] || "0", 16);
+    return (first & 0xfe00) === 0xfc00 || // unique local fc00::/7
+      (first & 0xffc0) === 0xfe80 || // link-local fe80::/10
+      (first & 0xff00) === 0xff00; // multicast
+  }
+  return false;
+}
+
+function isIpLiteral(host: string): boolean {
+  return /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":");
+}
+
+/**
+ * Validates a URL the server is about to download. Only http(s), and never a
+ * private or local host — the download runs with this server's network access,
+ * so an unchecked URL would let a prompt read internal services (or cloud
+ * metadata) and publish them to the media library. The configured WordPress
+ * host itself is always allowed, so local development sites still work.
+ */
+export function checkDownloadUrl(raw: string, allowedHosts: string[] = []): URL {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`"${raw}" is not a valid absolute URL. Pass a full http(s):// link to the file.`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Only http(s) URLs can be downloaded, not ${url.protocol}. For a file on this machine use file_path; for inline bytes use base64_data.`);
+  }
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (allowedHosts.map((h) => h.toLowerCase().replace(/^\[|\]$/g, "")).includes(host)) return url;
+  const localName = host === "localhost" || /\.(localhost|local|internal|lan|home\.arpa)$/.test(host) || (!host.includes(".") && !host.includes(":"));
+  if (localName || (isIpLiteral(host) && isPrivateAddress(host))) {
+    throw new Error(
+      `Refusing to download from "${url.hostname}": it is a private, loopback or local-network address. Only public URLs can be imported. If this is intentional (e.g. a trusted intranet), set WPX_ALLOW_PRIVATE_URLS=true on the MCP server.`
+    );
+  }
+  return url;
+}
+
+/** Node only: a public hostname can still resolve to an internal address. */
+export async function assertResolvesPublic(url: URL, allowedHosts: string[] = []) {
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (platform().kind !== "node" || isIpLiteral(host) || allowedHosts.includes(host.toLowerCase())) return;
+  let addresses: Array<{ address: string }>;
+  try {
+    const dns = await import("node:dns/promises");
+    addresses = await dns.lookup(host, { all: true, verbatim: true });
+  } catch {
+    return; // Unresolvable: let fetch report the real network error.
+  }
+  const internal = addresses.find((a) => isPrivateAddress(a.address));
+  if (internal) {
+    throw new Error(
+      `Refusing to download from "${host}": it resolves to ${internal.address}, a private or loopback address. Only public URLs can be imported. Set WPX_ALLOW_PRIVATE_URLS=true on the MCP server if this is intentional.`
+    );
+  }
+}
+
+/** Parses a Content-Disposition filename, preferring the RFC 5987 filename* form. */
+export function filenameFromDisposition(header: string | null | undefined): string | undefined {
+  if (!header) return undefined;
+  const star = /filename\*\s*=\s*"?[^']*'[^']*'([^;"]+)"?/i.exec(header);
+  if (star) return safeDecode(star[1].trim());
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
+  const value = (plain?.[1] ?? plain?.[2])?.trim();
+  return value || undefined;
+}
+
+/** sanitizeFilename drops non-ASCII, so "スクリーン.png" would become ".png"; keep a usable stem. */
+function safeFilename(name: string): string {
+  const cleaned = sanitizeFilename(name);
+  return /^\.[^.]*$/.test(cleaned) ? `upload${cleaned}` : cleaned;
+}
+
+function hasExtension(name: string): boolean {
+  return /\.[a-z0-9]{1,5}$/i.test(name);
+}
+
+async function fetchRemote(rawUrl: string, timeoutMs: number, siteHost: string): Promise<{ data: Uint8Array; filename: string; contentType: string }> {
+  const allowPrivate = platform().env.WPX_ALLOW_PRIVATE_URLS === "true";
+  const allowed = allowPrivate ? [] : [siteHost.toLowerCase()];
+  const check = (u: string) => (allowPrivate ? new URL(checkDownloadUrlScheme(u)) : checkDownloadUrl(u, allowed));
+
+  const controller = new AbortController();
+  // The timer covers the body download too, not just the response headers.
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    let current = check(rawUrl);
+    let res: Response | undefined;
+    for (let hop = 0; ; hop++) {
+      if (!allowPrivate) await assertResolvesPublic(current, allowed);
+      try {
+        res = await fetch(current.toString(), { signal: controller.signal, redirect: "manual", headers: { "User-Agent": "wpxmcp/2.0" } });
+      } catch (e: any) {
+        if (e?.name === "AbortError") throw new Error(`Downloading "${rawUrl}" timed out after ${timeoutMs}ms.`);
+        throw new Error(`Could not download "${current}": ${e?.message ?? e}. Check the URL is publicly reachable from the machine running this MCP server.`);
+      }
+      const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+      if (!location) break;
+      await res.body?.cancel().catch(() => undefined);
+      if (hop >= MAX_REDIRECTS) throw new Error(`Downloading "${rawUrl}" redirected more than ${MAX_REDIRECTS} times.`);
+      // Every hop is re-validated, so a public URL cannot bounce to an internal one.
+      current = check(new URL(location, current).toString());
+    }
+    if (!res.ok) throw new Error(`Downloading "${current}" returned HTTP ${res.status} ${res.statusText}.`);
+
+    const headerType = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (headerType === "text/html" || headerType === "application/xhtml+xml") {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`"${current}" returned a web page (${headerType}), not a file. Pass the direct link to the image or document itself — for stock sites, the download URL rather than the photo page.`);
+    }
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`That file is ${(declared / 1024 / 1024).toFixed(1)} MB, above the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB ceiling this tool enforces.`);
+    }
+
+    // Stream with a running cap, so a huge or endless body cannot exhaust memory.
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    const reader = res.body?.getReader();
+    if (reader) {
+      for (;;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try {
+          chunk = await reader.read();
+        } catch (e: any) {
+          if (e?.name === "AbortError") throw new Error(`Downloading "${rawUrl}" timed out after ${timeoutMs}ms.`);
+          throw e;
+        }
+        if (chunk.done) break;
+        total += chunk.value.byteLength;
+        if (total > MAX_UPLOAD_BYTES) {
+          await reader.cancel().catch(() => undefined);
+          throw new Error(`That file is larger than the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB ceiling this tool enforces.`);
+        }
+        chunks.push(chunk.value);
+      }
+    }
+    const buffer = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { buffer.set(c, offset); offset += c.byteLength; }
+    if (buffer.byteLength === 0) throw new Error(`Downloading "${current}" returned an empty body.`);
+
+    const urlName = safeDecode(current.pathname.split("/").pop() || "download");
+    const filename = safeFilename(filenameFromDisposition(res.headers.get("content-disposition")) ?? urlName);
+    const withExt = hasExtension(filename) ? filename : `${filename}${extensionFor(headerType)}`;
+    const generic = !headerType || headerType === "application/octet-stream" || headerType === "binary/octet-stream";
+    return { data: buffer, filename: withExt, contentType: generic ? guessMimeType(withExt) : headerType };
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) throw new Error(`Downloading "${url}" returned HTTP ${res.status} ${res.statusText}.`);
+}
 
-  const buffer = new Uint8Array(await res.arrayBuffer());
-  if (buffer.byteLength > MAX_UPLOAD_BYTES) {
-    throw new Error(`That file is ${(buffer.byteLength / 1024 / 1024).toFixed(1)} MB, above the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB ceiling this tool enforces.`);
+/** Scheme check alone, for deployments that opted out of the private-address guard. */
+function checkDownloadUrlScheme(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`"${raw}" is not a valid absolute URL. Pass a full http(s):// link to the file.`);
   }
-  const headerType = res.headers.get("content-type")?.split(";")[0]?.trim();
-  const urlName = (new URL(url).pathname.split("/").pop() || "download");
-  const disposition = res.headers.get("content-disposition");
-  const dispositionName = disposition ? /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(disposition)?.[1] : undefined;
-  const filename = sanitizeFilename(decodeURIComponent(dispositionName ?? urlName));
-  const withExt = /\.[a-z0-9]{1,5}$/i.test(filename) ? filename : `${filename}${extensionFor(headerType)}`;
-  return { data: buffer, filename: withExt, contentType: headerType || guessMimeType(withExt) };
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Only http(s) URLs can be downloaded, not ${url.protocol}.`);
+  }
+  return url.toString();
 }
 
 function extensionFor(mime?: string): string {
@@ -93,7 +278,7 @@ export function mediaTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         search: z.string().optional().describe("Match against title, caption, alt text and filename."),
-        media_type: z.enum(["image", "video", "audio", "application", "text", "file"]).optional().describe("Filter by broad media type."),
+        media_type: z.enum(["image", "video", "audio", "application", "text"]).optional().describe("Filter by broad media type."),
         mime_type: z.string().optional().describe("Filter by exact MIME type, e.g. \"image/png\"."),
         parent: z.number().int().optional().describe("Only attachments attached to this content ID."),
         author: z.number().int().optional().describe("User ID of the author."),
@@ -103,12 +288,12 @@ export function mediaTools(ctx: ToolContext) {
         page: z.number().int().min(1).optional().default(1).describe("Which page of results to return."),
         orderby: z.enum(["date", "id", "title", "slug", "modified", "include"]).optional().default("date").describe("Which field to sort by."),
         order: z.enum(["asc", "desc"]).optional().default("desc").describe("Sort direction."),
-        missing_alt_text: z.boolean().optional().default(false).describe("Return only images with empty alt text — useful for an accessibility or SEO sweep."),
+        missing_alt_text: z.boolean().optional().default(false).describe("Return only images with empty alt text — useful for an accessibility or SEO sweep. Filters within the requested page, so walk every page (or use audit_media) for a complete list."),
       },
       handler: async (args) => {
         const client = site(args.site_id);
         const res = await client.get<any[]>("/wp/v2/media", {
-          search: args.search, media_type: args.media_type, mime_type: args.mime_type,
+          search: args.search, media_type: args.missing_alt_text ? "image" : args.media_type, mime_type: args.mime_type,
           parent: args.parent, author: args.author, after: args.after, before: args.before,
           per_page: args.per_page, page: args.page, orderby: args.orderby, order: args.order,
         });
@@ -148,7 +333,7 @@ export function mediaTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         file_path: z.string().optional().describe("Absolute or ~-relative path on the machine running this MCP server. For a Mac screenshot that is typically \"~/Desktop/Screenshot 2026-08-23 at 2.29.04 PM.png\". Not a path on the WordPress host."),
-        url: z.string().optional().describe("Public URL to download and re-upload into the library."),
+        url: z.string().optional().describe("Public http(s) URL to download and re-upload into the library. Private, loopback and local-network addresses are refused (except the WordPress site's own host)."),
         base64_data: z.string().optional().describe("Raw base64 file contents (a data: URI prefix is accepted and stripped). Requires `filename`."),
         filename: z.string().optional().describe("Filename to store as. Defaults to the source filename; required for base64_data."),
         title: z.string().optional().describe("Media title. Defaults to the filename."),
@@ -175,18 +360,30 @@ export function mediaTools(ctx: ToolContext) {
           payload = readLocalFile(args.file_path);
           sourceNote = `local file ${args.file_path}`;
         } else if (args.url) {
-          payload = await fetchRemote(args.url, client.site.timeoutMs ?? 60000);
+          payload = await fetchRemote(args.url, Math.max(client.site.timeoutMs ?? 60000, 120000), new URL(client.baseUrl).hostname);
           sourceNote = `downloaded from ${args.url}`;
         } else {
           if (!args.filename) throw new Error("`filename` is required with base64_data, so WordPress knows the file type.");
-          const cleaned = args.base64_data!.replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
+          const dataUri = /^data:([^,;]*)[^,]*;base64,/i.exec(args.base64_data!);
+          const cleaned = args.base64_data!.slice(dataUri ? dataUri[0].length : 0).replace(/\s/g, "");
+          // Rough pre-check so an oversized payload is refused before it is decoded.
+          if (cleaned.length * 0.75 > MAX_UPLOAD_BYTES) {
+            throw new Error(`That file is above the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB ceiling.`);
+          }
           const data = decodeBase64(cleaned);
           if (data.byteLength === 0) throw new Error("base64_data decoded to zero bytes.");
-          payload = { data, filename: sanitizeFilename(args.filename), contentType: guessMimeType(args.filename) };
+          const filename = safeFilename(args.filename);
+          payload = { data, filename, contentType: guessMimeType(filename, dataUri?.[1] || "application/octet-stream") };
           sourceNote = "inline base64 data";
         }
 
-        if (args.filename) payload.filename = sanitizeFilename(args.filename);
+        if (args.filename && !args.base64_data) {
+          // Keep the source's extension when the override has none — WordPress
+          // decides whether a file type is allowed from the extension.
+          const override = safeFilename(args.filename);
+          const sourceExt = /\.[a-z0-9]{1,5}$/i.exec(payload.filename)?.[0] ?? "";
+          payload.filename = hasExtension(override) ? override : `${override}${sourceExt}`;
+        }
         if (payload.data.byteLength > MAX_UPLOAD_BYTES) {
           throw new Error(`That file is ${(payload.data.byteLength / 1024 / 1024).toFixed(1)} MB, above the ${MAX_UPLOAD_BYTES / 1024 / 1024} MB ceiling.`);
         }
@@ -197,25 +394,36 @@ export function mediaTools(ctx: ToolContext) {
           timeoutMs: Math.max(client.site.timeoutMs ?? 60000, 180000),
         });
         const id = upload.data.id;
+        audit({ site: client.site.id, tool: "create_media", action: "upload", target: id, outcome: "ok", detail: payload.filename });
 
         let description = args.description;
         if (args.attribution) description = [description, args.attribution].filter(Boolean).join("\n\n");
 
-        const updated = await applyMediaFields(client, id, {
-          title: args.title, alt_text: args.alt_text, caption: args.caption, description, post: args.post,
-        });
+        // The file is already in the library now. A failure in the follow-up
+        // steps must not hide its id, or a retry uploads a duplicate.
+        const warnings: string[] = [];
+        let updated: any = null;
+        try {
+          updated = await applyMediaFields(client, id, {
+            title: args.title, alt_text: args.alt_text, caption: args.caption, description, post: args.post,
+          });
+        } catch (e: any) {
+          warnings.push(`The file uploaded (id ${id}) but setting its title/alt text/caption failed: ${e.message}. Fix it with update_media id ${id} — do not upload again.`);
+        }
 
         let featured: any;
         if (args.set_as_featured_for) {
-          const typeBase = await client.restBaseForType(args.featured_for_type ?? "post");
-          const res = await client.post<any>(`/wp/v2/${typeBase}/${args.set_as_featured_for}`, { featured_media: id });
-          featured = { content_id: args.set_as_featured_for, type: args.featured_for_type, ok: res.data.featured_media === id };
+          try {
+            const typeInfo = await resolveType(client, args.featured_for_type ?? "post");
+            const res = await client.post<any>(`${typeInfo.route}/${args.set_as_featured_for}`, { featured_media: id });
+            featured = { content_id: args.set_as_featured_for, type: typeInfo.name, ok: res.data.featured_media === id };
+          } catch (e: any) {
+            featured = { content_id: args.set_as_featured_for, type: args.featured_for_type, ok: false, error: e.message };
+            warnings.push(`The file uploaded (id ${id}) but setting it as the featured image failed. Retry with update_content featured_media: ${id} — do not upload again.`);
+          }
         }
 
-        audit({ site: client.site.id, tool: "create_media", action: "upload", target: id, outcome: "ok", detail: payload.filename });
-
         const shaped = shapeMedia(updated ?? upload.data);
-        const warnings: string[] = [];
         if (shaped.media_type === "image" && !shaped.alt_text) {
           warnings.push("No alt text was set on this image. Add it with update_media — screen readers and search engines both rely on it.");
         }
@@ -273,6 +481,7 @@ export function mediaTools(ctx: ToolContext) {
         client.assertWritable("edit_media");
         const updated = await applyMediaFields(client, id, fields);
         if (!updated) throw new Error("No fields to update were supplied.");
+        audit({ site: client.site.id, tool: "edit_media", action: "update", target: id, outcome: "ok", detail: Object.keys(fields).filter((k) => (fields as any)[k] !== undefined).join(",") });
         return ok({ updated: true, ...shapeMedia(updated) }, "edit_media is a legacy alias — update_media is the current name.");
       },
     }),

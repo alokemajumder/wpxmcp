@@ -97,13 +97,15 @@ function safeEqual(a: string, b: string): boolean {
  * issued for one preview cannot be replayed against different arguments.
  */
 export function fingerprintOp(parts: unknown[]): string {
-  const input = JSON.stringify(parts);
+  // Hashed as UTF-8 bytes. Masking UTF-16 code units to their low byte made
+  // every non-ASCII character collide with an ASCII one ("Ā" and "\u0000").
+  const input = new TextEncoder().encode(JSON.stringify(parts));
   // FNV-1a, 64-bit: identical on Node and Workers without needing a hash API.
   let hash = 0xcbf29ce484222325n;
   const prime = 0x100000001b3n;
   const mask = 0xffffffffffffffffn;
-  for (let i = 0; i < input.length; i++) {
-    hash = ((hash ^ BigInt(input.charCodeAt(i) & 0xff)) * prime) & mask;
+  for (const byte of input) {
+    hash = ((hash ^ BigInt(byte)) * prime) & mask;
   }
   return hash.toString(16).padStart(16, "0");
 }
@@ -151,11 +153,14 @@ export async function consumeConfirmation(token: string, fingerprint: string): P
       reason: "The arguments changed since the preview was generated, so the token no longer matches. Re-run without a token to preview the new operation, then confirm that.",
     };
   }
-  if (spent.has(token)) {
+  const shared = platform().spentTokens;
+  const tokenHash = shared ? await sha256Hex(token) : "";
+  if (spent.has(token) || (shared && (await shared.has(tokenHash).catch(() => false)))) {
     return { valid: false, reason: "That confirm_token has already been used. Re-run the tool without a token to get a fresh preview." };
   }
 
   spent.set(token, decoded.x);
+  if (shared) await shared.add(tokenHash, decoded.x).catch(() => undefined);
   if (spent.size > 500) {
     // Drop only what can no longer be replayed anyway.
     const now = Date.now();
@@ -168,11 +173,121 @@ export async function consumeConfirmation(token: string, fingerprint: string): P
  * SQL guard — SELECT-only by default
  * ------------------------------------------------------------------ */
 
-const SQL_MUTATING = [
-  "insert", "update", "delete", "drop", "truncate", "alter", "create", "replace",
-  "grant", "revoke", "rename", "call", "handler", "load", "lock", "unlock",
-  "set", "prepare", "execute", "into outfile", "into dumpfile",
+/**
+ * Keywords that make a statement need approval. Each is matched as a whole word
+ * against the query with string literals and comments removed, so a post titled
+ * "How to delete a page" does not trip it and a keyword cannot hide in a comment.
+ */
+const SQL_MUTATING: Array<{ label: string; pattern: RegExp }> = [
+  ...[
+    "update", "delete", "drop", "alter", "create", "grant", "revoke", "rename", "call",
+    "handler", "load", "lock", "unlock", "set", "prepare", "execute",
+  ].map((kw) => ({ label: kw, pattern: new RegExp(`\\b${kw}\\b`) })),
+  // INSERT(), REPLACE() and TRUNCATE() are also ordinary string/number functions.
+  // A read cannot contain the statement forms, so only the function call is let through.
+  ...["insert", "replace", "truncate"].map((kw) => ({ label: kw, pattern: new RegExp(`\\b${kw}\\b(?!\\s*\\()`) })),
+  { label: "into outfile", pattern: /\binto\s+outfile\b/ },
+  { label: "into dumpfile", pattern: /\binto\s+dumpfile\b/ },
+  // Reads that are still dangerous: a file off the database server's disk, or a
+  // query built to hold a PHP worker hostage.
+  { label: "load_file", pattern: /\bload_file\s*\(/ },
+  { label: "sleep", pattern: /\bsleep\s*\(/ },
+  { label: "benchmark", pattern: /\bbenchmark\s*\(/ },
+  { label: "get_lock", pattern: /\bget_lock\s*\(/ },
 ];
+
+interface LexedSql {
+  /** Comments removed and whitespace collapsed, string literals untouched. This is what runs. */
+  normalized: string;
+  /** The same, with every quoted literal emptied — what keywords and `;` are searched in. */
+  masked: string;
+}
+
+/**
+ * A MySQL-aware scan of a query.
+ *
+ * Regexes over the raw text cannot tell a comment marker from the same
+ * characters inside a string: `'#fff'` lost everything after the `#`, and
+ * whitespace inside literals was collapsed, rewriting the data a mutation
+ * writes. MySQL's own rules apply here instead: `-- ` needs trailing
+ * whitespace, and a `/*! ... *\/` comment is executed, so its body is code.
+ *
+ * `backslashEscapes` mirrors the server's sql_mode — whether `\'` continues a
+ * string (the default) or NO_BACKSLASH_ESCAPES is on. A string left unterminated
+ * is not masked, so nothing can hide inside it.
+ */
+function lexSql(input: string, backslashEscapes: boolean): LexedSql {
+  let normalized = "";
+  let masked = "";
+  let pendingSpace = false;
+  let src = input;
+  let i = 0;
+
+  const emit = (n: string, m: string) => {
+    if (pendingSpace && normalized) {
+      normalized += " ";
+      masked += " ";
+    }
+    pendingSpace = false;
+    normalized += n;
+    masked += m;
+  };
+
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (/\s/.test(ch)) {
+      pendingSpace = true;
+      i++;
+    } else if (ch === "/" && next === "*") {
+      const close = src.indexOf("*/", i + 2);
+      const end = close === -1 ? src.length : close;
+      if (src[i + 2] === "!") {
+        // Executable comment: splice its body back in as ordinary code.
+        const body = src.slice(i + 3, end).replace(/^\d{5,6}/, "");
+        src = src.slice(0, i) + " " + body + " " + src.slice(close === -1 ? src.length : close + 2);
+      } else {
+        pendingSpace = true;
+        i = close === -1 ? src.length : close + 2;
+      }
+    } else if (ch === "#" || (ch === "-" && next === "-" && (i + 2 >= src.length || /[\s\x00-\x1f]/.test(src[i + 2])))) {
+      const eol = src.indexOf("\n", i);
+      pendingSpace = true;
+      i = eol === -1 ? src.length : eol + 1;
+    } else if (ch === "'" || ch === '"' || ch === "`") {
+      let j = i + 1;
+      let closed = false;
+      while (j < src.length) {
+        if (backslashEscapes && ch !== "`" && src[j] === "\\") {
+          j += 2;
+        } else if (src[j] === ch) {
+          if (src[j + 1] === ch) {
+            j += 2; // a doubled quote is an escaped quote
+          } else {
+            closed = true;
+            break;
+          }
+        } else {
+          j++;
+        }
+      }
+      if (closed) {
+        emit(src.slice(i, j + 1), ch + ch);
+        i = j + 1;
+      } else {
+        emit(src.slice(i), src.slice(i));
+        i = src.length;
+      }
+    } else {
+      emit(ch, ch);
+      i++;
+    }
+  }
+
+  const trailing = /[;\s]+$/;
+  return { normalized: normalized.replace(trailing, ""), masked: masked.replace(trailing, "") };
+}
 
 export interface SqlVerdict {
   allowed: boolean;
@@ -183,51 +298,58 @@ export interface SqlVerdict {
 }
 
 export function inspectSql(rawQuery: string, allowMutations: boolean): SqlVerdict {
-  const stripped = rawQuery
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--[^\n]*/g, " ")
-    .replace(/#[^\n]*/g, " ")
-    .trim();
-  const normalized = stripped.replace(/\s+/g, " ").replace(/;\s*$/, "");
-  const lower = normalized.toLowerCase();
+  const { normalized } = lexSql(rawQuery, true);
 
-  const statements = normalized.split(";").map((s) => s.trim()).filter(Boolean);
-  if (statements.length > 1) {
+  // The normalized text is what gets executed, so that is what is inspected —
+  // under both escape modes, since which one applies is the server's setting.
+  const views = [lexSql(normalized, true).masked, lexSql(normalized, false).masked].map((m) => m.toLowerCase());
+
+  const statementCount = Math.max(...views.map((m) => m.split(";").map((part) => part.trim()).filter(Boolean).length));
+  if (statementCount > 1) {
     return {
-      allowed: false, mutating: true, normalized, statementCount: statements.length,
+      allowed: false, mutating: true, normalized, statementCount,
       reason: "Multiple statements in one query are refused — stacked queries are a classic injection shape. Send one statement at a time.",
     };
   }
 
-  const startsRead = /^(select|show|describe|desc|explain|with)\b/.test(lower);
-  const hit = SQL_MUTATING.find((kw) =>
-    kw.includes(" ") ? lower.includes(kw) : new RegExp(`\\b${kw}\\b`).test(lower)
-  );
+  const startsRead = views.every((m) => /^\(*\s*(select|show|describe|desc|explain|with)\b/.test(m));
+  let hit: string | undefined;
+  for (const view of views) {
+    hit = SQL_MUTATING.find((kw) => kw.pattern.test(view))?.label;
+    if (hit) break;
+  }
 
   if (startsRead && !hit) {
     return { allowed: true, mutating: false, normalized, statementCount: 1 };
   }
-  if (!startsRead || hit) {
-    const mutating = true;
-    if (!allowMutations) {
-      return {
-        allowed: false, mutating, normalized, statementCount: 1,
-        reason: startsRead
-          ? `The query reads but contains the blocked keyword "${hit}". Mutating SQL needs allow_mutation: true plus a confirm_token.`
-          : `Only SELECT/SHOW/DESCRIBE/EXPLAIN/WITH run without approval. This statement starts with "${lower.split(/\s+/)[0]}", so it needs allow_mutation: true plus a confirm_token.`,
-      };
-    }
-    return { allowed: true, mutating, normalized, statementCount: 1 };
+  if (!allowMutations) {
+    return {
+      allowed: false, mutating: true, normalized, statementCount: 1,
+      reason: startsRead
+        ? `The query reads but contains the blocked keyword "${hit}". Mutating SQL needs allow_mutation: true plus a confirm_token.`
+        : `Only SELECT/SHOW/DESCRIBE/EXPLAIN/WITH run without approval. This statement starts with "${views[0].split(/\s+/)[0]}", so it needs allow_mutation: true plus a confirm_token.`,
+    };
   }
-  return { allowed: true, mutating: false, normalized, statementCount: 1 };
+  return { allowed: true, mutating: true, normalized, statementCount: 1 };
 }
 
 /** Forces a LIMIT onto an unbounded SELECT so a huge table cannot flood the context. */
 export function enforceRowLimit(query: string, maxRows: number): { query: string; applied: boolean } {
-  const lower = query.toLowerCase();
-  if (!/^\s*(select|with)\b/.test(lower)) return { query, applied: false };
-  if (/\blimit\s+\d+/.test(lower)) return { query, applied: false };
-  return { query: `${query.replace(/;\s*$/, "")} LIMIT ${maxRows}`, applied: true };
+  // Normalizing first means a trailing comment cannot swallow the appended LIMIT.
+  const { normalized, masked } = lexSql(query, true);
+  const lower = masked.toLowerCase();
+  if (!/^\(*\s*(select|with)\b/.test(lower)) return { query, applied: false };
+
+  // Only a LIMIT outside every parenthesis bounds the result; one in a subquery does not.
+  let depth = 0;
+  let topLevel = "";
+  for (const ch of lower) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0) topLevel += ch;
+  }
+  if (/\blimit\s+\d/.test(topLevel)) return { query, applied: false };
+  return { query: `${normalized} LIMIT ${maxRows}`, applied: true };
 }
 
 /* ------------------------------------------------------------------ *
@@ -244,7 +366,6 @@ export const CLI_ALLOWLIST: Record<string, { write: boolean; description: string
   "cron event run": { write: true, description: "Run a due cron event now" },
   "db size": { write: false, description: "Report database and table sizes" },
   "db tables": { write: false, description: "List database tables" },
-  "eval": { write: true, description: "Evaluate PHP (blocked unless WPX_ALLOW_EVAL=true on the server AND enabled site-side)" },
   "option get": { write: false, description: "Read an option" },
   "option list": { write: false, description: "List options" },
   "option update": { write: true, description: "Write an option" },
@@ -265,7 +386,6 @@ export const CLI_ALLOWLIST: Record<string, { write: boolean; description: string
   "rewrite list": { write: false, description: "List rewrite rules" },
   "role list": { write: false, description: "List roles" },
   "search-replace": { write: true, description: "Search and replace across tables (dry-run first)" },
-  "site list": { write: false, description: "List sites on a multisite network" },
   "theme list": { write: false, description: "List themes" },
   "theme get": { write: false, description: "Show one theme" },
   "theme activate": { write: true, description: "Activate a theme" },
@@ -282,13 +402,10 @@ export const CLI_ALLOWLIST: Record<string, { write: boolean; description: string
   "user meta update": { write: true, description: "Write user meta" },
   "user add-role": { write: true, description: "Add a role to a user" },
   "user remove-role": { write: true, description: "Remove a role from a user" },
-  "user create": { write: true, description: "Create a user" },
-  "user update": { write: true, description: "Update a user" },
   "menu list": { write: false, description: "List nav menus" },
   "menu item list": { write: false, description: "List items in a nav menu" },
   "sidebar list": { write: false, description: "List sidebars" },
   "widget list": { write: false, description: "List widgets in a sidebar" },
-  "language core list": { write: false, description: "List installed core translations" },
   "maintenance-mode status": { write: false, description: "Report maintenance mode" },
   "maintenance-mode activate": { write: true, description: "Enter maintenance mode" },
   "maintenance-mode deactivate": { write: true, description: "Leave maintenance mode" },
@@ -324,8 +441,10 @@ export function inspectCliCommand(command: string): CliVerdict {
   }
 
   const matched = candidates[0];
-  if (matched === "eval" && platform().env.WPX_ALLOW_EVAL !== "true") {
-    return { allowed: false, write: true, matched, reason: "`eval` executes arbitrary PHP and is disabled. Set WPX_ALLOW_EVAL=true on the MCP server (and enable it site-side) only if you truly need it." };
-  }
   return { allowed: true, write: CLI_ALLOWLIST[matched].write, matched };
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

@@ -1,7 +1,7 @@
 {
   "name": "wpxmcp",
-  "version": "1.0.0",
-  "description": "MCP server for managing self-hosted WordPress sites \u2014 content, taxonomies, media, users, comments, plugins, themes, menus, widgets, design and SQL. Multi-site.",
+  "version": "2.0.0",
+  "description": "MCP server for managing self-hosted WordPress sites — content, taxonomies, media, users, comments, plugins, themes, menus, widgets, design and SQL. Multi-site.",
   "type": "module",
   "bin": {
     "wpxmcp": "dist/index.js"
@@ -28,8 +28,9 @@
     "cf:deploy": "wrangler deploy",
     "cf:tail": "wrangler tail",
     "prepublishOnly": "npm run build",
-    "audit": "node audit/run.mjs && node audit/run2.mjs && node audit/run3.mjs",
-    "audit:worker": "node audit/worker.mjs"
+    "audit": "node audit/run.mjs && node audit/run2.mjs && node audit/run3.mjs && node audit/run4.mjs",
+    "audit:worker": "node audit/worker.mjs",
+    "docs:tools": "node scripts/gen-tools-doc.mjs"
   },
   "keywords": [
     "mcp",
@@ -40,12 +41,13 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/server": "^2.0.0",
     "undici": "^7.2.0",
-    "zod": "^4.5.4"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260823.1",
+    "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^26.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
@@ -60,7 +62,7 @@
   },
   "homepage": "https://github.com/alokemajumder/wpxmcp#readme",
   "cloudflare": {
-    "label": "wpxmcp \u2014 WordPress MCP server",
+    "label": "wpxmcp — WordPress MCP server",
     "products": [
       "Workers"
     ],

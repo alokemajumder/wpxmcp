@@ -108,7 +108,6 @@ for (const [n, a] of [
   else console.log(`  ${n}: fails cleanly → ${r.text.slice(0, 90).replace(/\s+/g, " ")}`);
 }
 
-const all = JSON.parse((await import("node:fs")).readFileSync("audit/all-tools.json", "utf8"));
 console.log(`\n${"═".repeat(60)}`);
 console.log(`Covered here : ${R.covered.size}`);
 console.log(`Problems     : ${problems.length}`);

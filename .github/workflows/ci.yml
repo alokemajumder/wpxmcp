@@ -43,39 +43,11 @@ jobs:
           git diff --exit-code src/generated/skills.ts \
             || (echo "::error::src/generated/skills.ts is stale. Run 'npm run bundle:skills' and commit the result." && exit 1)
 
-      - name: Verify both entry points register the same tools
+      - name: Verify the tool reference is current
         run: |
-          node -e "
-            import('./dist/toolset.js').then(async ({ buildToolset }) => {
-              const { SiteRegistry } = await import('./dist/lib/registry.js');
-              const { installNodePlatform } = await import('./dist/platform-node.js');
-              installNodePlatform();
-              const tools = buildToolset({ registry: new SiteRegistry() });
-              console.log(tools.length + ' tools registered');
-              if (tools.length < 100) { console.error('Unexpectedly few tools'); process.exit(1); }
-              let problems = 0;
-              for (const t of tools) {
-                if (!t.description || t.description.length < 40) {
-                  console.error('Tool ' + t.name + ' has an inadequate description');
-                  problems++;
-                }
-                for (const [k, v] of Object.entries(t.schema)) {
-                  if (k === 'site_id') continue;
-                  const d = v?._def?.description
-                    ?? v?._def?.innerType?._def?.description
-                    ?? v?._def?.innerType?._def?.innerType?._def?.description;
-                  if (!d) {
-                    console.error('Parameter ' + t.name + '.' + k + ' has no .describe()');
-                    problems++;
-                  }
-                }
-              }
-              if (problems) {
-                console.error('::error::' + problems + ' tool or parameter descriptions are missing. A model chooses tools by reading these.');
-                process.exit(1);
-              }
-            }).catch((e) => { console.error(e); process.exit(1); });
-          "
+          npm run docs:tools
+          git diff --exit-code docs/TOOLS.md \
+            || (echo "::error::docs/TOOLS.md is stale. Run 'npm run build && npm run docs:tools' and commit the result." && exit 1)
 
   php:
     name: PHP ${{ matrix.php }} lint

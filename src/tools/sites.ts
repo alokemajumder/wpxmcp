@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { defineTool, ok, siteIdSchema, type ToolContext } from "../lib/tooling.js";
 import { readAudit } from "../lib/safety.js";
+import { platform } from "../lib/platform.js";
 
 export function siteTools(ctx: ToolContext) {
   const { registry } = ctx;
@@ -199,7 +200,7 @@ export function siteTools(ctx: ToolContext) {
         const filter = all_sites ? undefined : registry.sites.length ? registry.resolve(site_id).site.id : undefined;
         const entries = readAudit(limit, filter);
         return ok({
-          log_file: "~/.wpxmcp/audit.log.jsonl",
+          log_file: platform().kind === "node" ? "~/.wpxmcp/audit.log.jsonl" : "in-memory ring on this server instance (not persisted; the companion plugin keeps a site-side log)",
           filtered_to_site: filter ?? "(all)",
           count: entries.length,
           entries,

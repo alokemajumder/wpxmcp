@@ -121,24 +121,47 @@ curl https://wpxmcp.<your-subdomain>.workers.dev/health
 ```json
 {
   "service": "wpxmcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "runtime": "cloudflare-workers",
   "transport": "streamable-http (stateless)",
+  "protocol": ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
   "endpoint": "/mcp",
   "auth_configured": true
 }
 ```
 
-`"auth_configured": false` means `WPX_AUTH_TOKEN` did not get set — go back to step 3. The health endpoint is deliberately unauthenticated and deliberately reveals nothing about your sites.
+`"auth_configured": false` means `WPX_AUTH_TOKEN` did not get set — go back to step 3. The health endpoint is deliberately unauthenticated and deliberately reveals nothing about your sites: no site names, URLs or counts.
 
-Then check the MCP endpoint itself:
+Then check the MCP endpoint itself. This is a 2025-era request, which needs no handshake on a stateless server; the `Accept` header must list both types or the server answers `406`:
 
 ```bash
 curl -s https://wpxmcp.<your-subdomain>.workers.dev/mcp \
   -H "Authorization: Bearer $WPX_AUTH_TOKEN" \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | head -c 400
 ```
+
+The reply may arrive as a single Server-Sent Events message (`event: message` / `data: {...}`); that is normal.
+
+### Protocol support
+
+One endpoint serves both generations of the protocol, through the SDK's `createMcpHandler`:
+
+- **MCP 2026-07-28** — stateless by design: no `initialize` handshake and no session; each request carries its protocol version, client info and capabilities in a `_meta` envelope plus the `MCP-Protocol-Version` and `Mcp-Method` headers, and `server/discover` replaces the handshake. `tools/list` results carry a one-hour, private cache hint, since the tool list never varies per caller.
+- **2025-era clients** (`2025-11-25`, `2025-06-18`, `2025-03-26`) — served through the stateless `initialize` idiom. The SDK also still accepts `2024-11-05` in an `initialize` request.
+
+Nothing needs configuring: the version each request names decides how it is handled. A fresh server is built per request, so no state is shared between callers and an isolate can be evicted between calls.
+
+### Request limits
+
+- **Body size:** a request whose declared `Content-Length` exceeds **32 MiB** is refused with `413` before any work is done. Tool arguments are small; the largest legitimate body is a `create_media` upload sent as `base64_data`. For large files, pass `url` instead.
+- **GET `/mcp`** returns `405` — a stateless server holds no server-initiated stream open.
+- **Configuration errors** (a malformed `WPX_SITES`, say) come back as HTTP 500 with a JSON-RPC error whose message names the problem (`Server configuration error: …`), rather than an unexplained failure.
+
+### Bundle size
+
+The Worker bundles to roughly **3 MB, about 640 KB gzipped** (`npx wrangler deploy --dry-run` prints the figure; CI runs that dry-run build on every push). That is comfortably inside Cloudflare's size limit for the free plan.
 
 ---
 
@@ -177,7 +200,19 @@ Set the origins allowed to call your Worker, in `wrangler.json`:
 }
 ```
 
-Redeploy afterwards. Leave it empty for clients that are not browsers — CORS is irrelevant to them, and an empty allowlist is the safer default.
+Redeploy afterwards. Leave it empty for clients that are not browsers — CORS is irrelevant to them, and an empty allowlist is the safer default. `*` allows any origin; the bearer token is still required either way.
+
+Every response — including the `401` and `503` refusals, so a browser client can read why it was turned away — carries:
+
+| Header | Value |
+| --- | --- |
+| `Access-Control-Allow-Origin` | The request's `Origin`, when it is in the allowlist (or `*` is) |
+| `Access-Control-Allow-Methods` | `POST, GET, DELETE, OPTIONS` |
+| `Access-Control-Allow-Headers` | `Content-Type, Accept, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID` |
+| `Access-Control-Expose-Headers` | `Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate` |
+| `Access-Control-Max-Age` | `86400` |
+
+`Mcp-Method` and `Mcp-Name` are the routing headers 2026-07-28 clients send, so a browser preflight must allow them.
 
 Ask the client: *"List my WordPress sites."*
 
@@ -266,9 +301,10 @@ Then revoke the Application Passwords in wp-admin. Deleting the Worker stops acc
 | `create_media` with `file_path` | ✅ Reads your disk | ❌ No shared filesystem — use `url` or `base64_data` |
 | `save_skill` | ✅ Writes to `~/.wpxmcp/skills` | ❌ Add playbooks to `skills/` and redeploy |
 | Audit log | Append-only file | In-memory, or KV |
+| Private-address check on outbound fetches | Hostname, IP literal **and** DNS resolution | Hostname and IP literal (the DNS check runs on Node only) |
 | Everything else | Identical | Identical |
 
-Both entry points build from the same `src/toolset.ts`, so the tool surface cannot drift. The two limitations above are inherent to not having a filesystem, and the affected tools say so plainly when called.
+Both entry points build the same server through `src/lib/server.ts`, from the same `src/toolset.ts`, so the tool surface cannot drift. The filesystem limitations above are inherent to the platform, and the affected tools say so plainly when called.
 
 ---
 
@@ -280,6 +316,9 @@ Both entry points build from the same `src/toolset.ts`, so the tool surface cann
 | `401 Unauthorized` | The token is missing or wrong. Check the `Authorization: Bearer …` header. |
 | `No WordPress sites are configured` | `WPX_SITES` is unset or malformed. It must be a JSON **array** or object map. |
 | `Could not parse WPX_SITES` | Invalid JSON — usually a smart quote from copy-paste, or a missing comma. |
+| `413` from `/mcp` | The request body is over 32 MiB — almost always a large `base64_data` upload. Pass the file by `url`. |
+| `406 Not Acceptable` | The client did not send `Accept: application/json, text/event-stream`. |
+| `400` mentioning `_meta` or `Mcp-Method` | A 2026-07-28 request is missing its per-request envelope or routing header. Use an SDK client, or send a 2025-era request without the `MCP-Protocol-Version: 2026-07-28` header. |
 | Timeouts against one site | Raise `timeoutMs` on that site. Workers allow up to 300s. |
 | Site returns HTML, not JSON | A security plugin or WAF is challenging the Worker. Allowlist Cloudflare, or check the REST prefix. |
 | 401 from WordPress itself | The host is stripping the `Authorization` header — add the passthrough rule in [CONFIGURATION.md](CONFIGURATION.md). |

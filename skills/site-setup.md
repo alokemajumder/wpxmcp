@@ -1,75 +1,67 @@
 ---
 name: site-setup
 title: Connecting a WordPress site
-description: How to connect a self-hosted WordPress site, generate credentials, and diagnose the auth failures that actually happen.
-keywords: connect, setup, credentials, application password, 401, authentication, getting started, configure
+description: Use when connecting a new WordPress site to wpxmcp, creating an Application Password, installing the companion plugin, or fixing authentication and connection failures.
+keywords: connect, connect a site, connect a new site, add site, setup, set up, getting started, configure, credentials, application password, app password, authentication, 401, unauthorized, sites.json, companion plugin, wpxmcp-helper, install helper, rest api disabled, authorization header
 ---
 
-## Connect a site
+## When this applies
 
-1. **Generate an Application Password** in WordPress:
-   `wp-admin → Users → Profile → Application Passwords → New Application Password Name → Add New`.
-   Copy the generated value. It looks like `abcd EFGH ijkl MNOP qrst UVWX` — keep the spaces, they are fine.
+First-time setup, adding a site, or `test_site` reporting a connection or authentication problem.
 
-2. **Configure the MCP server** with one of:
+## Rules
 
-   ```jsonc
-   // ~/.wpxmcp/sites.json — many sites
-   {
-     "sites": [
-       { "id": "main",    "url": "https://example.com",      "username": "admin", "appPassword": "abcd EFGH ijkl MNOP" },
-       { "id": "staging", "url": "https://staging.example.com", "username": "admin", "appPassword": "...", "allowInsecureTLS": true }
-     ]
-   }
-   ```
+1. Never ask for the account's login password. wpxmcp uses an Application Password (or a bearer token), which can be revoked on its own.
+2. Use an Administrator account when plugin, theme, user or settings work is expected; Editors can manage content only.
+3. Application Passwords only work over HTTPS, or when `WP_ENVIRONMENT_TYPE` is `local`. Some security plugins disable them.
+4. Mark production `"writable": false` while experimenting; every write tool then refuses.
+5. Credentials never go into skills, content or reports.
 
-   ```bash
-   # or environment variables — single site
-   WORDPRESS_URL=https://example.com
-   WORDPRESS_USERNAME=admin
-   WORDPRESS_APP_PASSWORD="abcd EFGH ijkl MNOP"
-   ```
+## Procedure
 
-3. **Verify** with `test_site`. It checks reachability, authentication, the role's capabilities, and whether the companion plugin is present — and names the specific problem when something is wrong.
+1. In wp-admin: Users → Profile → Application Passwords → name it (for example "wpxmcp") → Add New Application Password. Copy the value; spaces are fine.
+2. Configure one of:
 
-## Install the companion plugin
+```jsonc
+// ~/.wpxmcp/sites.json (or WPX_SITES_FILE=path, or WPX_SITES=inline JSON on Workers)
+{ "sites": [
+  { "id": "main", "url": "https://example.com", "username": "admin", "appPassword": "abcd EFGH ijkl MNOP qrst UVWX" },
+  { "id": "staging", "url": "https://staging.example.com", "username": "admin", "appPassword": "…", "allowInsecureTLS": true, "writable": false }
+] }
+```
 
-Core REST cannot do everything. The companion plugin (`wp-plugin/wpxmcp-helper`) adds the things WordPress does not expose over REST: SQL, WP-CLI emulation, theme file access and drafts, unregistered post meta, theme mods, options, site health and editable fields.
+   Single site via environment: `WORDPRESS_URL`, `WORDPRESS_USERNAME`, `WORDPRESS_APP_PASSWORD`. Several via `WP_SITE_{ID}_URL`, `WP_SITE_{ID}_USERNAME`, `WP_SITE_{ID}_APP_PASSWORD`. Optional per site: `restPrefix`, `headers` (for Cloudflare Access or basic-auth gates), `timeoutMs`. The default site is `WPX_DEFAULT_SITE` or the first one.
+3. `test_site` (with `site_id` when several exist). It reports reachability, the authenticated user, roles and capabilities, and whether the companion plugin is active.
+4. Companion plugin: zip `wp-plugin/wpxmcp-helper` → Plugins → Add New → Upload Plugin → Activate. It adds WP-CLI emulation, SQL, theme files and drafts, unregistered meta, options, theme mods, editable fields, error log, cache purge, backup status, profiler and the inspect tools. Core content, media, users, comments, menus, plugins and themes work without it.
+5. `test_site` again, then `get_site` for versions, permalinks and available capabilities.
 
-Zip the `wpxmcp-helper` folder → `Plugins → Add New → Upload Plugin` → activate. Run `test_site` again; the `wpxmcp/v1` namespace should appear.
+## Verify
 
-Everything else — posts, pages, media, taxonomies, users, comments, plugins, menus, widgets — works without it.
+`test_site` shows authenticated as the expected user with the expected role, and the companion plugin as detected when installed. `list_sites` shows the id to pass as `site_id`.
 
-## Auth failures and what they actually mean
+## Report back
+
+Which sites are connected, as which user and role, whether each is writable, and whether the companion plugin is active (and what is unavailable without it).
+
+## Reference: failures
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| 401 on every request | The host strips the `Authorization` header | Add the passthrough rule below |
-| 401 with correct credentials | Application Passwords disabled, or the site is not on HTTPS | WordPress disables them over plain HTTP unless `WP_ENVIRONMENT_TYPE` is `local` |
-| 403 on writes only | The role is too low | Use an Editor or Administrator account |
-| `rest_no_route` | A security plugin disabled the REST API, or the URL is wrong | Check `discover_rest_routes` |
-| HTML returned instead of JSON | A WAF or security plugin is serving a challenge page | Allowlist the server's IP |
-| 404 on every route | No pretty permalinks | Set `"restPrefix": "/?rest_route="` on the site config |
-
-Apache passthrough, in `.htaccess` above the WordPress block:
+| 401 on every request, correct password | Host strips the `Authorization` header | Passthrough rule below |
+| 401 on a plain-HTTP site | Application Passwords unavailable without HTTPS | Enable HTTPS, or set `WP_ENVIRONMENT_TYPE` to `local` on a dev install |
+| 401 `incorrect_password` / `invalid_username` | Wrong or revoked credential | Create a new Application Password |
+| 403 on writes only | Role too low, or a security plugin blocks REST writes | Administrator account; allowlist in the security plugin |
+| `rest_no_route` on everything | REST disabled by a security plugin, or wrong URL | Re-enable REST for authenticated users; check `url` |
+| 404 on every route | Plain permalinks, so `/wp-json/` does not exist | `"restPrefix": "/?rest_route="` |
+| HTML instead of JSON | WAF or bot-protection challenge | Allowlist the server's IP or add `headers` |
 
 ```apache
+# .htaccess, above the WordPress block
 RewriteCond %{HTTP:Authorization} ^(.*)
 RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
 ```
 
-Nginx + php-fpm, in the `location ~ \.php$` block:
-
 ```nginx
+# inside location ~ \.php$
 fastcgi_param HTTP_AUTHORIZATION $http_authorization;
-```
-
-## Multiple sites
-
-Every content, taxonomy, media, user and admin tool takes an optional `site_id`. With one site configured it is optional. With several, name the site or the default (first, or `WPX_DEFAULT_SITE`) is used. `list_sites` shows the ids.
-
-Mark production read-only while experimenting:
-
-```json
-{ "id": "prod", "url": "https://example.com", "username": "...", "appPassword": "...", "writable": false }
 ```

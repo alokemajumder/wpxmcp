@@ -1,0 +1,350 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  compareVersions, isAffected, affectingVulns, vulnSeverity, wpOrgSlug, phpSupportStatus,
+  looksLikePhpLog, looksLikeWpConfig, looksLikeVimSwap, looksLikeGitHead, looksLikeEnvFile, looksLikeDirectoryListing,
+  generatorVersion, redactExcerpt, securityHeaderFindings, cacheHeaderSummary, scoreFindings, sortFindings,
+  insideFindings, isLocalHost,
+} from "../dist/lib/ops-security.js";
+import { buildToolset } from "../dist/toolset.js";
+import { SiteRegistry } from "../dist/lib/registry.js";
+import { installNodePlatform } from "../dist/platform-node.js";
+import { matchSkills } from "../dist/lib/skills.js";
+
+installNodePlatform();
+
+/* ------------------------------ versions ------------------------------ */
+
+test("compareVersions handles WordPress-style versions", () => {
+  assert.equal(compareVersions("6.4.1", "6.4.1"), 0);
+  assert.equal(compareVersions("6.4", "6.4.0"), 0);
+  assert.equal(compareVersions("6.4.1", "6.10"), -1);
+  assert.equal(compareVersions("5.3.2", "5.3.10"), -1);
+  assert.equal(compareVersions("2.0", "1.99.99"), 1);
+  assert.equal(compareVersions("1.0.0-beta2", "1.0.0"), -1);
+  assert.equal(compareVersions("v3.1", "3.1"), 0);
+});
+
+test("isAffected applies WPVulnerability operator ranges", () => {
+  assert.equal(isAffected("5.3.1", { max_version: "5.3.2", max_operator: "lt" }), true);
+  assert.equal(isAffected("5.3.2", { max_version: "5.3.2", max_operator: "lt" }), false);
+  assert.equal(isAffected("5.3.2", { max_version: "5.3.2", max_operator: "le" }), true);
+  assert.equal(isAffected("1.5", { min_version: "2.0", min_operator: "ge", max_version: "2.4", max_operator: "lt" }), false);
+  assert.equal(isAffected("2.1", { min_version: "2.0", min_operator: "ge", max_version: "2.4", max_operator: "lt" }), true);
+  assert.equal(isAffected("9.9", { min_version: "2.0", min_operator: "gt", unfixed: "1" }), true);
+  assert.equal(isAffected("9.9", null), true);
+});
+
+// Shape captured from https://www.wpvulnerability.net/plugin/contact-form-7/ (trimmed).
+const CF7 = {
+  name: "Contact Form 7", plugin: "contact-form-7",
+  vulnerability: [
+    {
+      name: "Contact Form 7 [contact-form-7] < 5.3.2",
+      operator: { min_version: null, min_operator: null, max_version: "5.3.2", max_operator: "lt", unfixed: "0", closed: "0" },
+      source: [{ id: "CVE-2020-35489", name: "CVE-2020-35489" }, { id: "7391118e", name: "wpscan" }],
+      impact: { cvss: { score: "10.0", severity: "c" }, cvss3: { score: "10.0", severity: "critical" } },
+    },
+    {
+      name: "Contact Form 7 [contact-form-7] < 5.8.4",
+      operator: { max_version: "5.8.4", max_operator: "lt", unfixed: "0" },
+      source: [{ id: "CVE-2023-6449" }],
+      impact: { cvss3: { score: "7.2", severity: "high" } },
+    },
+    {
+      name: "Contact Form 7 [contact-form-7] <= 5.9.9 (unfixed?)",
+      operator: { min_version: "5.9", min_operator: "ge", max_version: "5.9.9", max_operator: "le", unfixed: "0" },
+      source: [],
+      impact: [],
+    },
+  ],
+};
+
+test("affectingVulns keeps only entries covering the installed version", () => {
+  const old = affectingVulns(CF7, "5.3.1");
+  assert.equal(old.affected.length, 2);
+  assert.equal(old.worst, "critical");
+  assert.equal(old.fixed_in, "5.8.4");
+  assert.deepEqual(old.affected[0].ids, ["CVE-2020-35489"]);
+
+  const mid = affectingVulns(CF7, "5.8.0");
+  assert.equal(mid.affected.length, 1);
+  assert.equal(mid.worst, "high");
+
+  const le = affectingVulns(CF7, "5.9.9");
+  assert.equal(le.affected.length, 1);
+  assert.equal(le.fixed_in, "> 5.9.9", "an le range means the named version itself is vulnerable");
+  assert.equal(le.worst, "medium", "no CVSS published defaults to medium");
+
+  assert.equal(affectingVulns(CF7, "6.0").affected.length, 0);
+  assert.equal(affectingVulns({ vulnerability: null }, "1.0").affected.length, 0);
+});
+
+test("core responses have no operator and apply as-is", () => {
+  const core = { core: "6.4.1", vulnerability: [{ name: "6.4.1", impact: { cvss: { severity: "h" } } }] };
+  const v = affectingVulns(core, "6.4.1");
+  assert.equal(v.affected.length, 1);
+  assert.equal(v.worst, "high");
+});
+
+test("vulnSeverity falls back from words to letters to scores", () => {
+  assert.equal(vulnSeverity({ impact: { cvss3: { severity: "LOW" } } }), "low");
+  assert.equal(vulnSeverity({ impact: { cvss: { severity: "m" } } }), "medium");
+  assert.equal(vulnSeverity({ impact: { cvss3: { score: "9.8" } } }), "critical");
+  assert.equal(vulnSeverity({}), "medium");
+});
+
+test("wordpress.org slug mapping", () => {
+  assert.equal(wpOrgSlug("plugin", "hello"), "hello-dolly");
+  assert.equal(wpOrgSlug("plugin", "akismet"), "akismet");
+  assert.equal(wpOrgSlug("theme", "hello"), "hello");
+});
+
+test("PHP support status is computed against the date, not hardcoded", () => {
+  const now = new Date("2026-09-15T00:00:00Z");
+  assert.equal(phpSupportStatus("7.4.33", now).eol, true);
+  assert.equal(phpSupportStatus("8.1.2", now).eol, true);
+  const p82 = phpSupportStatus("8.2.10", now);
+  assert.equal(p82.eol, false);
+  assert.ok(p82.months_left < 6);
+  assert.equal(phpSupportStatus("8.4.1", now).eol, false);
+  assert.equal(phpSupportStatus("5.4.0", now).eol, true);
+});
+
+/* ----------------------------- signatures ----------------------------- */
+
+test("exposed-file signatures do not fire on a soft-404 HTML page", () => {
+  const html = "<!DOCTYPE html><html><head><title>Page not found</title></head><body>DB_PASSWORD PHP Warning: x</body></html>";
+  assert.equal(looksLikePhpLog(html), false);
+  assert.equal(looksLikeWpConfig(html), false);
+  assert.equal(looksLikeEnvFile(html), false);
+  assert.equal(looksLikeGitHead(html), false);
+});
+
+test("exposed-file signatures recognise the real thing", () => {
+  assert.equal(looksLikePhpLog("[15-Sep-2026 10:00:00 UTC] PHP Warning:  msg in /x.php on line 12\n"), true);
+  assert.equal(looksLikeWpConfig("<?php\ndefine( 'DB_NAME', 'wp' );\n"), true);
+  assert.equal(looksLikeVimSwap("b0VIM 8.2\u0000\u0000"), true);
+  assert.equal(looksLikeGitHead("ref: refs/heads/main\n"), true);
+  assert.equal(looksLikeGitHead("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3\n"), true);
+  assert.equal(looksLikeEnvFile("# comment\nAPP_ENV=prod\nDB_PASSWORD=x\n"), true);
+  assert.equal(looksLikeEnvFile("hello world\nthis is prose\n"), false);
+  assert.equal(looksLikeDirectoryListing("<html><head><title>Index of /wp-content/uploads</title>"), true);
+});
+
+test("generator version extraction", () => {
+  assert.equal(generatorVersion('<meta name="generator" content="WordPress 7.1" />'), "7.1");
+  assert.equal(generatorVersion("<meta content='WordPress 6.5.2' name='generator'>"), "6.5.2");
+  assert.equal(generatorVersion('<meta name="generator" content="Elementor 3.2">'), null);
+});
+
+test("redactExcerpt withholds secrets, paths and emails and stays short", () => {
+  const out = redactExcerpt("DB_PASSWORD=hunter2 user admin@example.com at /var/www/html/wp-config.php " + "x".repeat(500), 500);
+  assert.ok(!out.includes("hunter2"));
+  assert.ok(!out.includes("admin@example.com"));
+  assert.ok(!out.includes("/var/www"));
+  assert.ok(out.length <= 200);
+});
+
+/* ------------------------------- headers ------------------------------- */
+
+test("security header findings", () => {
+  const bare = securityHeaderFindings({}, true, false).map((f) => f.id).sort();
+  assert.deepEqual(bare, ["header_framing_unrestricted", "header_hsts_missing", "header_nosniff_missing", "header_referrer_policy_missing"]);
+  const good = securityHeaderFindings({
+    "Strict-Transport-Security": "max-age=31536000", "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "frame-ancestors 'self'", "Referrer-Policy": "same-origin",
+  }, true, false);
+  assert.equal(good.length, 0);
+  assert.ok(!securityHeaderFindings({}, false, false).some((f) => f.id === "header_hsts_missing"), "HSTS only matters on https");
+  assert.ok(securityHeaderFindings({}, true, true).every((f) => f.severity === "info"), "local sites are downgraded");
+});
+
+test("cache header summary verdicts", () => {
+  assert.equal(cacheHeaderSummary({ "cf-cache-status": "HIT", age: "120" }).verdict, "hit");
+  assert.equal(cacheHeaderSummary({ "x-litespeed-cache": "miss" }).verdict, "miss");
+  assert.equal(cacheHeaderSummary({ "cf-cache-status": "BYPASS" }).verdict, "bypass");
+  assert.equal(cacheHeaderSummary({ "cache-control": "no-cache" }).verdict, "unknown");
+  const h = new Headers({ "x-cache": "HIT from varnish", "content-type": "text/html" });
+  const s = cacheHeaderSummary(h);
+  assert.equal(s.verdict, "hit");
+  assert.deepEqual(Object.keys(s.headers), ["x-cache"]);
+});
+
+/* ------------------------------- scoring ------------------------------- */
+
+const f = (id, severity) => ({ id, severity, title: id, evidence: "", fix: "" });
+
+test("score and grade", () => {
+  assert.deepEqual(scoreFindings([]), { score: 100, grade: "A" });
+  assert.equal(scoreFindings([f("a", "info"), f("b", "low")]).grade, "A");
+  const withCritical = scoreFindings([f("a", "critical")]);
+  assert.ok(withCritical.score <= 49 && withCritical.grade === "F", "any critical is an F");
+  assert.ok(scoreFindings([f("a", "high")]).score <= 79, "any high caps below B");
+  assert.equal(scoreFindings(Array.from({ length: 30 }, (_, i) => f(`x${i}`, "critical"))).score, 0);
+});
+
+test("findings sort by severity", () => {
+  const sorted = sortFindings([f("z", "low"), f("a", "info"), f("m", "critical"), f("b", "high")]);
+  assert.deepEqual(sorted.map((x) => x.severity), ["critical", "high", "low", "info"]);
+});
+
+test("isLocalHost", () => {
+  for (const h of ["localhost", "127.0.0.1", "mysite.local", "site.test", "192.168.1.5", "10.0.0.2"]) assert.equal(isLocalHost(h), true, h);
+  for (const h of ["example.com", "8.8.8.8", "172.32.0.1"]) assert.equal(isLocalHost(h), false, h);
+});
+
+/* ---------------------------- inside checks ---------------------------- */
+
+const SECURE = {
+  wordpress: { version: "7.1", latest: "7.1", update_available: false, environment: "production" },
+  php: { version: "8.4.3" },
+  debug: { WP_DEBUG: false, WP_DEBUG_DISPLAY: true, WP_DEBUG_LOG: false, display_errors: false, debug_log_in_webroot: false },
+  hardening: { DISALLOW_FILE_EDIT: true, xmlrpc_enabled: false, default_salts: false, table_prefix: "x7_", users_can_register: false, default_role: "subscriber" },
+  wp_config: { found: true, mode: "0640", world_readable: false, world_writable: false, windows: false },
+  ssl: { is_ssl: true, home_scheme: "https", siteurl_scheme: "https" },
+  admins: { count: 1, list: [{ id: 1, login: "janedoe", weak_name: false, application_passwords: 0, app_password_list: [] }], application_passwords_total: 0 },
+  plugins: { total: 2, inactive: 0, installed: [], updates: [], auto_update_enabled: 1 },
+  themes: { total: 2, inactive: 1, installed: [], updates: [] },
+  auto_updates: { AUTOMATIC_UPDATER_DISABLED: false },
+};
+
+test("a hardened site produces no inside findings", () => {
+  assert.deepEqual(insideFindings(SECURE, { now: new Date("2026-09-15T00:00:00Z") }), []);
+});
+
+test("inside checks flag the classic misconfigurations", () => {
+  const now = new Date("2026-09-15T00:00:00Z");
+  const bad = structuredClone(SECURE);
+  bad.debug.WP_DEBUG = true;
+  bad.hardening.DISALLOW_FILE_EDIT = false;
+  bad.hardening.default_salts = true;
+  bad.hardening.users_can_register = true;
+  bad.hardening.default_role = "administrator";
+  bad.wp_config.world_writable = true;
+  bad.ssl.home_scheme = "http";
+  bad.admins.list = [{ login: "admin", weak_name: true, application_passwords: 1, app_password_list: [{ name: "old", created: "2025-01-01T00:00:00Z", last_used: null }] }];
+  bad.admins.application_passwords_total = 1;
+  bad.wordpress = { version: "7.0.1", latest: "7.0.3", update_available: true };
+  bad.php.version = "7.4.33";
+  bad.plugins.updates = [{ file: "akismet/akismet.php", current: "5.0", new: "5.7" }];
+  bad.auto_updates.AUTOMATIC_UPDATER_DISABLED = true;
+
+  const byId = Object.fromEntries(insideFindings(bad, { now }).map((x) => [x.id, x]));
+  assert.equal(byId.debug_display_on?.severity, "high");
+  assert.equal(byId.file_editor_enabled?.severity, "medium");
+  assert.equal(byId.default_salts?.severity, "high");
+  assert.equal(byId.open_registration_privileged_role?.severity, "critical");
+  assert.equal(byId.wp_config_world_writable?.severity, "critical");
+  assert.equal(byId.no_https?.severity, "high");
+  assert.ok(byId.admin_guessable_username);
+  assert.ok(byId.stale_application_passwords, "a never-used password created 20 months ago is stale");
+  assert.equal(byId.core_outdated?.severity, "high", "a missed minor release on the same branch is a security gap");
+  assert.equal(byId.php_eol?.severity, "high");
+  assert.equal(byId.plugin_updates?.severity, "high");
+  assert.ok(byId.auto_updates_disabled);
+});
+
+test("local environments downgrade https and debug-display findings", () => {
+  const bad = structuredClone(SECURE);
+  bad.debug.WP_DEBUG = true;
+  bad.ssl.home_scheme = "http";
+  const byId = Object.fromEntries(insideFindings(bad, { local: true }).map((x) => [x.id, x]));
+  assert.equal(byId.no_https.severity, "info");
+  assert.equal(byId.debug_display_on.severity, "info");
+});
+
+test("a public debug.log is reported by the external probe, not duplicated inside", () => {
+  const s = structuredClone(SECURE);
+  s.debug.debug_log_in_webroot = true;
+  assert.equal(insideFindings(s, { debugLogPublic: true }).some((x) => x.id === "debug_log_in_webroot"), false);
+  assert.equal(insideFindings(s, { debugLogPublic: false }).find((x) => x.id === "debug_log_in_webroot")?.severity, "low");
+  assert.equal(insideFindings(s, { debugLogPublic: null }).find((x) => x.id === "debug_log_in_webroot")?.severity, "medium");
+});
+
+/* -------------------------------- tools -------------------------------- */
+
+test("ops tools are registered with the right annotations and described params", () => {
+  const tools = Object.fromEntries(buildToolset({ registry: new SiteRegistry() }).map((t) => [t.name, t]));
+  for (const name of ["tail_error_log", "purge_cache", "security_audit", "backup_status"]) {
+    const t = tools[name];
+    assert.ok(t, `${name} is registered`);
+    assert.ok(t.description.length > 80);
+    for (const [k, v] of Object.entries(t.schema)) {
+      if (k === "site_id") continue;
+      assert.ok(v.description, `${name}.${k} has a description`);
+    }
+  }
+  assert.equal(tools.tail_error_log.readOnly, true);
+  assert.equal(tools.security_audit.readOnly, true);
+  assert.equal(tools.backup_status.readOnly, true);
+  assert.ok(!tools.purge_cache.readOnly, "purging writes");
+  assert.ok(!tools.purge_cache.destructive);
+});
+
+test("tool argument validation", () => {
+  const tools = Object.fromEntries(buildToolset({ registry: new SiteRegistry() }).map((t) => [t.name, t]));
+  const lines = tools.tail_error_log.schema.lines;
+  assert.equal(lines.safeParse(2001).success, false);
+  assert.equal(lines.safeParse(0).success, false);
+  assert.equal(lines.parse(undefined), 200);
+  assert.equal(tools.tail_error_log.schema.level.safeParse("verbose").success, false);
+  assert.equal(tools.security_audit.schema.max_lookups.safeParse(61).success, false);
+  assert.equal(tools.purge_cache.schema.scope.safeParse("page").success, false);
+});
+
+test("security requests route to the security-hardening playbook", () => {
+  for (const q of ["is my site hacked", "harden wordpress security", "check for plugin vulnerabilities", "run a security audit"]) {
+    assert.equal(matchSkills(q)[0]?.name, "security-hardening", q);
+  }
+});
+
+/* ------------------------- companion plugin PHP ------------------------ */
+
+const php = spawnSync("php", ["-v"], { encoding: "utf8" });
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("PHP log parsing, path redaction and attribution", { skip: php.status !== 0 ? "php binary not available" : false }, () => {
+  const script = `
+    define('ABSPATH', '/srv/www/site/');
+    define('WP_CONTENT_DIR', '/srv/www/site/wp-content');
+    define('WP_PLUGIN_DIR', '/srv/www/site/wp-content/plugins');
+    function untrailingslashit($s) { return rtrim($s, '/\\\\'); }
+    function add_filter() {}
+    require ${JSON.stringify(path.join(root, "wp-plugin/wpxmcp-helper/includes/class-wpxmcp-diagnostics.php"))};
+    $lines = array(
+      '[15-Sep-2026 10:00:00 UTC] PHP Warning:  Undefined variable $x in /srv/www/site/wp-content/plugins/acme-forms/inc/a.php on line 12',
+      '[15-Sep-2026 10:00:01 UTC] PHP Fatal error:  Uncaught Error: Call to undefined function foo() in /srv/www/site/wp-content/themes/astra/functions.php:40',
+      '[15-Sep-2026 10:00:02 UTC] PHP Deprecated:  Creation of dynamic property is deprecated in /srv/www/site/wp-includes/class-wp.php on line 5',
+      '[15-Sep-2026 10:00:03 UTC] WordPress database error Table wp_x doesn\\'t exist for query SELECT 1',
+      'not a log line',
+    );
+    $out = array();
+    foreach ($lines as $l) {
+      $p = WPXMCP_Diagnostics::parse_log_line($l);
+      if ($p) { $p['file'] = $p['file'] ? WPXMCP_Diagnostics::redact_paths($p['file']) : null; $p['source'] = $p['file'] ? WPXMCP_Diagnostics::attribute_path($p['file']) : null; }
+      $out[] = $p;
+    }
+    $out[] = WPXMCP_Diagnostics::redact_paths("#4 /srv/www/site/wp-config.php(106): require_once('/srv/www/site/wp-sett...') include('/home/other/lo...')");
+    echo json_encode($out);
+  `;
+  const r = spawnSync("php", ["-r", script], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  const [warn, fatal, dep, db, none, trace] = JSON.parse(r.stdout);
+  assert.equal(warn.level, "warning");
+  assert.equal(warn.file, "wp-content/plugins/acme-forms/inc/a.php");
+  assert.equal(warn.line, 12);
+  assert.equal(warn.source, "plugins/acme-forms");
+  assert.equal(warn.time, Date.parse("2026-09-15T10:00:00Z") / 1000);
+  assert.equal(fatal.level, "fatal");
+  assert.equal(fatal.line, 40);
+  assert.equal(fatal.source, "themes/astra");
+  assert.equal(dep.level, "deprecated");
+  assert.equal(dep.source, "core");
+  assert.equal(db.level, "error");
+  assert.equal(none, null);
+  assert.equal(trace, "#4 wp-config.php(106): require_once('wp-sett...') include('…')", "shortened absolute paths outside the install are hidden");
+});

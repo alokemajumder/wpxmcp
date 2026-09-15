@@ -18,6 +18,36 @@ function shapePlugin(p: any) {
   };
 }
 
+/**
+ * A plugin identifier as core's REST route expects it: "dir/file" with no
+ * ".php". Core's pattern is `[^.\/]+(?:\/[^.\/]+)?`, so a dot anywhere cannot
+ * be addressed at all, and a dot segment would resolve to a different route.
+ */
+export function pluginId(value: string): string {
+  const clean = String(value ?? "").trim().replace(/^\/+|\/+$/g, "").replace(/\.php$/i, "");
+  if (!clean || clean.split("/").length > 2 || /[?#\\%]/.test(clean)) {
+    throw new Error(`"${value}" is not a valid plugin identifier. Use the \`plugin\` value list_plugins returns, e.g. "akismet/akismet".`);
+  }
+  if (clean.includes(".")) {
+    throw new Error(`"${value}" contains a dot, which WordPress's /wp/v2/plugins route cannot address. Use run_wp_cli (e.g. "plugin activate ${clean.split("/")[0]}") for this plugin instead.`);
+  }
+  return clean;
+}
+
+async function wordpressOrg(url: URL, what: string): Promise<any> {
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { "User-Agent": "wpxmcp/2.0" }, signal: AbortSignal.timeout(20_000) });
+  } catch (e: any) {
+    const cause = e?.name === "TimeoutError" ? "timed out after 20s" : e?.cause?.code ?? e?.message ?? String(e);
+    throw new Error(`Could not reach WordPress.org for ${what} (${cause}). The MCP server needs outbound HTTPS to api.wordpress.org; install_plugin by slug runs on the site instead and does not need it.`);
+  }
+  const json: any = await res.json().catch(() => null);
+  if (json?.error) throw new Error(`WordPress.org: ${json.error}. Check the slug — it is the last path segment of the plugin's wordpress.org URL.`);
+  if (!res.ok || !json) throw new Error(`WordPress.org returned HTTP ${res.status} for ${what}.`);
+  return json;
+}
+
 export function pluginTools(ctx: ToolContext) {
   const { registry } = ctx;
   const site = (id?: string) => registry.resolve(id);
@@ -60,7 +90,7 @@ export function pluginTools(ctx: ToolContext) {
       },
       handler: async ({ site_id, plugin }) => {
         const client = site(site_id);
-        const res = await client.get<any>(`/wp/v2/plugins/${plugin.replace(/\.php$/, "")}`, { context: "edit" });
+        const res = await client.get<any>(`/wp/v2/plugins/${pluginId(plugin)}`, { context: "edit" });
         return ok(shapePlugin(res.data));
       },
     }),
@@ -78,7 +108,7 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin, network_wide }) => {
         const client = site(site_id);
         client.assertWritable("activate_plugin");
-        const id = plugin.replace(/\.php$/, "");
+        const id = pluginId(plugin);
         const res = await client.post<any>(`/wp/v2/plugins/${id}`, { status: network_wide ? "network-active" : "active" });
         audit({ site: client.site.id, tool: "activate_plugin", action: "activate", target: plugin, outcome: "ok" });
         return ok({ activated: true, ...shapePlugin(res.data) });
@@ -96,7 +126,7 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin }) => {
         const client = site(site_id);
         client.assertWritable("deactivate_plugin");
-        const id = plugin.replace(/\.php$/, "");
+        const id = pluginId(plugin);
         const res = await client.post<any>(`/wp/v2/plugins/${id}`, { status: "inactive" });
         audit({ site: client.site.id, tool: "deactivate_plugin", action: "deactivate", target: plugin, outcome: "ok" });
         return ok({ deactivated: true, ...shapePlugin(res.data) });
@@ -129,7 +159,7 @@ export function pluginTools(ctx: ToolContext) {
       schema: {
         site_id: siteIdSchema,
         slug: z.string().describe("WordPress.org plugin slug."),
-        status: z.enum(["active", "inactive"]).optional().default("inactive").describe("Filter by status."),
+        status: z.enum(["active", "inactive"]).optional().default("inactive").describe("Status to leave the plugin in after installing: \"active\" activates it immediately."),
       },
       handler: async ({ site_id, slug, status }) => {
         const client = site(site_id);
@@ -154,11 +184,14 @@ export function pluginTools(ctx: ToolContext) {
       handler: async ({ site_id, plugin, confirm }) => {
         const client = site(site_id);
         client.assertWritable("delete_plugin");
-        const id = plugin.replace(/\.php$/, "");
+        const id = pluginId(plugin);
         if (!confirm) {
           const current = await client.get<any>(`/wp/v2/plugins/${id}`, { context: "edit" });
+          const active = current.data?.status && current.data.status !== "inactive";
           return ok({ deleted: false, requires_confirmation: true, plugin: shapePlugin(current.data) },
-            "Deleting a plugin removes its files, and many plugins drop their database tables when uninstalled. Nothing was deleted — re-run with confirm: true if that is what you want.");
+            active
+              ? "This plugin is still active, and WordPress refuses to delete an active plugin. Nothing was deleted — run deactivate_plugin first, then re-run with confirm: true."
+              : "Deleting a plugin removes its files, and many plugins drop their database tables when uninstalled. Nothing was deleted — re-run with confirm: true if that is what you want.");
         }
         await client.del(`/wp/v2/plugins/${id}`);
         audit({ site: client.site.id, tool: "delete_plugin", action: "delete", target: plugin, outcome: "ok" });
@@ -173,7 +206,7 @@ export function pluginTools(ctx: ToolContext) {
       description:
         "Search the public WordPress.org plugin repository. Returns slug, rating, install count, last-updated date and compatibility — enough to judge whether a plugin is maintained before installing it. This queries WordPress.org, not your site.",
       schema: {
-        search: z.string().describe("What to search for, e.g. \"contact form\" or \"seo\"."),
+        search: z.string().min(1).describe("What to search for, e.g. \"contact form\" or \"seo\"."),
         per_page: z.number().int().min(1).max(50).optional().default(10).describe("How many results per page."),
         page: z.number().int().min(1).optional().default(1).describe("Which page of results to return."),
       },
@@ -186,9 +219,7 @@ export function pluginTools(ctx: ToolContext) {
         for (const f of ["short_description", "last_updated", "active_installs", "ratings", "tested", "requires", "requires_php", "downloaded"]) {
           url.searchParams.set(`request[fields][${f}]`, "1");
         }
-        const res = await fetch(url, { headers: { "User-Agent": "wpxmcp/1.0" } });
-        if (!res.ok) throw new Error(`WordPress.org returned HTTP ${res.status}.`);
-        const json: any = await res.json();
+        const json = await wordpressOrg(url, `the search "${search}"`);
         return ok({
           query: search,
           total: json.info?.results,
@@ -226,10 +257,7 @@ export function pluginTools(ctx: ToolContext) {
         const url = new URL("https://api.wordpress.org/plugins/info/1.2/");
         url.searchParams.set("action", "plugin_information");
         url.searchParams.set("request[slug]", slug);
-        const res = await fetch(url, { headers: { "User-Agent": "wpxmcp/1.0" } });
-        if (!res.ok) throw new Error(`WordPress.org returned HTTP ${res.status} for "${slug}".`);
-        const p: any = await res.json();
-        if (p.error) throw new Error(`WordPress.org: ${p.error}. Check the slug — it is the last path segment of the plugin's wordpress.org URL.`);
+        const p = await wordpressOrg(url, `"${slug}"`);
 
         const payload: any = {
           slug: p.slug,

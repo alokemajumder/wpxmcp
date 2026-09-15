@@ -38,7 +38,7 @@ export function hintForFailure(status: number, code?: string): string | undefine
     return "The authenticated user lacks the capability for this request. Posts in a non-published status and most `edit` context fields require an Editor/Administrator role.";
   }
   if (code === "rest_cookie_invalid_nonce") {
-    return "The site answered with a cookie-auth error, which usually means the Authorization header was stripped. Add the SetEnvIf/RewriteRule Authorization passthrough shown in the README.";
+    return "WordPress fell back to cookie authentication, which means the Application Password never reached PHP — usually because the host strips the Authorization header. Add the Authorization passthrough from docs/WORDPRESS_AUTH.md, then run test_site.";
   }
   if (status === 401) {
     return "Authentication failed. Confirm the username and Application Password (Users -> Profile -> Application Passwords), keep the spaces in the password, and make sure the site is served over HTTPS.";

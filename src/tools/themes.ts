@@ -3,7 +3,43 @@ import { defineTool, ok, siteIdSchema, stripHtml, trimText, type ToolContext } f
 import { applyEdits, type EditOp } from "../lib/content-utils.js";
 import { audit } from "../lib/safety.js";
 import type { WordPressClient } from "../lib/client.js";
-import { classicThemeScaffold } from "../lib/theme-scaffold.js";
+import { classicThemeScaffold, sanitizeThemeSlug } from "../lib/theme-scaffold.js";
+
+/**
+ * A theme stylesheet as a REST path segment. Core's route allows one inner
+ * slash (themes in a subdirectory), but a dot segment, query or fragment would
+ * make the URL resolve to a different route entirely.
+ */
+export function themeStylesheet(value: string): string {
+  const clean = String(value ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!clean || /[?#\\%:<>*"|\s]/.test(clean) || clean.split("/").some((part) => part === "." || part === "..") || clean.split("/").length > 2) {
+    throw new Error(`"${value}" is not a valid theme stylesheet. Use the directory name list_themes reports, e.g. "twentytwentyfive".`);
+  }
+  return clean;
+}
+
+/**
+ * Site Editor changes (user global styles, edited templates and parts) belong to
+ * the active theme, so switching to a draft silently leaves them behind.
+ */
+async function liveSiteEditorCustomizations(client: WordPressClient): Promise<{ global_styles: boolean; templates: string[] }> {
+  const result = { global_styles: false, templates: [] as string[] };
+  try {
+    const active = (await client.get<any[]>("/wp/v2/themes", { status: "active", context: "edit" })).data?.[0];
+    const id = active?._links?.["wp:user-global-styles"]?.[0]?.href?.split("/").pop();
+    if (id) {
+      const user = (await client.get<any>(`/wp/v2/global-styles/${id}`, { context: "edit" })).data;
+      result.global_styles = Object.keys(user?.styles ?? {}).length > 0 || Object.keys(user?.settings ?? {}).length > 0;
+    }
+    for (const route of ["/wp/v2/templates", "/wp/v2/template-parts"]) {
+      const items = (await client.get<any[]>(route, { context: "edit", per_page: 100 })).data ?? [];
+      for (const t of items) if (t?.source === "custom" && t?.theme === active?.stylesheet) result.templates.push(String(t.id));
+    }
+  } catch {
+    /* classic theme or no Site Editor routes: nothing to carry over */
+  }
+  return result;
+}
 
 async function helper(client: WordPressClient, action: string): Promise<string> {
   const ns = client.site.helperNamespace ?? "wpxmcp/v1";
@@ -25,7 +61,7 @@ function shapeTheme(t: any) {
     author: stripHtml(String(t.author?.rendered ?? t.author ?? "")),
     description: stripHtml(String(t.description?.rendered ?? t.description ?? "")).slice(0, 400),
     is_block_theme: t.is_block_theme,
-    parent: t.parent ?? t.template !== t.stylesheet ? t.template : undefined,
+    parent: t.template && t.template !== t.stylesheet ? t.template : undefined,
     theme_supports: t.theme_supports ? Object.keys(t.theme_supports).filter((k) => t.theme_supports[k]) : undefined,
     screenshot: t.screenshot,
   };
@@ -68,7 +104,7 @@ export function themeTools(ctx: ToolContext) {
       schema: { site_id: siteIdSchema, stylesheet: z.string().describe("Theme directory name, e.g. \"twentytwentyfour\".") },
       handler: async ({ site_id, stylesheet }) => {
         const client = site(site_id);
-        const res = await client.get<any>(`/wp/v2/themes/${stylesheet}`, { context: "edit" });
+        const res = await client.get<any>(`/wp/v2/themes/${themeStylesheet(stylesheet)}`, { context: "edit" });
         return ok({ ...shapeTheme(res.data), theme_supports: res.data.theme_supports });
       },
     }),
@@ -123,6 +159,66 @@ export function themeTools(ctx: ToolContext) {
       },
     }),
 
+    defineTool({
+      name: "search_themes",
+      title: "Search the theme repository",
+      readOnly: true,
+      description:
+        "Search the public WordPress.org theme directory. Returns slug, version, rating, install count, last-updated date, compatibility and whether it is a block theme — enough to choose one before install_theme. This queries WordPress.org, not your site.",
+      schema: {
+        search: z.string().min(1).describe("What to search for, e.g. \"portfolio\" or \"minimal blog\"."),
+        block_themes_only: z.boolean().optional().default(false).describe("Only return block (full-site-editing) themes."),
+        per_page: z.number().int().min(1).max(50).optional().default(10).describe("How many results per page."),
+        page: z.number().int().min(1).optional().default(1).describe("Which page of results to return."),
+      },
+      handler: async ({ search, block_themes_only, per_page, page }) => {
+        const url = new URL("https://api.wordpress.org/themes/info/1.2/");
+        url.searchParams.set("action", "query_themes");
+        url.searchParams.set("request[search]", search);
+        if (block_themes_only) url.searchParams.set("request[tag]", "full-site-editing");
+        url.searchParams.set("request[per_page]", String(per_page));
+        url.searchParams.set("request[page]", String(page));
+        for (const f of ["description", "rating", "num_ratings", "active_installs", "last_updated", "requires", "requires_php", "tags", "homepage"]) {
+          url.searchParams.set(`request[fields][${f}]`, "1");
+        }
+        let res: Response;
+        try {
+          res = await fetch(url, { headers: { "User-Agent": "wpxmcp/2.0" }, signal: AbortSignal.timeout(20_000) });
+        } catch (e: any) {
+          // "fetch failed" alone says nothing; name the service and the underlying cause.
+          const cause = e?.name === "TimeoutError" ? "timed out after 20s" : e?.cause?.code ?? e?.message ?? String(e);
+          throw new Error(`Could not reach WordPress.org to search themes (${cause}). The MCP server needs outbound HTTPS to api.wordpress.org; installing by slug with install_theme runs on the site instead and does not need it.`);
+        }
+        if (!res.ok) throw new Error(`WordPress.org returned HTTP ${res.status}.`);
+        const json: any = await res.json();
+        return ok({
+          query: search,
+          total: json.info?.results,
+          page,
+          pages: json.info?.pages,
+          themes: (json.themes ?? []).map((t: any) => {
+            const tags = t.tags && typeof t.tags === "object" ? Object.keys(t.tags) : [];
+            return {
+              slug: t.slug,
+              name: stripHtml(String(t.name ?? "")),
+              version: t.version,
+              author: stripHtml(String(t.author?.display_name ?? t.author?.user_nicename ?? t.author ?? "")),
+              is_block_theme: tags.includes("full-site-editing"),
+              rating_percent: t.rating,
+              num_ratings: t.num_ratings,
+              active_installs: t.active_installs,
+              last_updated: t.last_updated,
+              requires_wp: t.requires || undefined,
+              requires_php: t.requires_php || undefined,
+              description: stripHtml(String(t.description ?? "")).slice(0, 300),
+              preview_url: t.preview_url,
+              homepage: t.homepage,
+            };
+          }),
+        }, "Install with install_theme using the `slug`, then work on it through create_draft_theme rather than activating it directly.");
+      },
+    }),
+
     /* ------------------------------------------------------------------ *
      * Draft theme workflow
      * ------------------------------------------------------------------ */
@@ -157,7 +253,7 @@ export function themeTools(ctx: ToolContext) {
         name: z.string().describe("Theme display name, e.g. \"Northwind\"."),
         slug: z.string().optional().describe("Theme directory name. Derived from the name if omitted."),
         description: z.string().optional().describe("Theme description for style.css."),
-        author: z.string().optional().default("wpxmcp").describe("User ID of the author."),
+        author: z.string().optional().default("wpxmcp").describe("Author name written into the style.css header."),
         tokens: z.object({
           primary: z.string().optional().describe("Primary brand color as a hex value, e.g. \"#1d4ed8\"."),
           accent: z.string().optional().describe("Accent color hex."),
@@ -172,8 +268,11 @@ export function themeTools(ctx: ToolContext) {
       handler: async (args) => {
         const client = site(args.site_id);
         client.assertWritable("create_classic_theme");
+        const slug = sanitizeThemeSlug(args.slug ?? args.name);
+        if (!slug) {
+          throw new Error(`Could not derive a theme directory name from "${args.slug ?? args.name}". Pass \`slug\` explicitly, using lowercase letters, digits and hyphens.`);
+        }
         const ns = await helper(client, "create_classic_theme");
-        const slug = (args.slug ?? args.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
         const files = classicThemeScaffold({
           name: args.name,
           slug,
@@ -183,9 +282,12 @@ export function themeTools(ctx: ToolContext) {
         });
         const res = await client.post<any>(`/${ns}/themes/scaffold`, { slug, name: args.name, files, as_draft: args.as_draft });
         audit({ site: client.site.id, tool: "create_classic_theme", action: "scaffold", target: slug, outcome: "ok", detail: `${Object.keys(files).length} files` });
+        const skipped = res.data?.files_skipped && typeof res.data.files_skipped === "object" ? Object.keys(res.data.files_skipped) : [];
         return ok(
           { created: true, slug: res.data?.stylesheet ?? slug, files_written: Object.keys(files), ...res.data },
-          "Scaffold written. All design tokens live in theme.css — change them there rather than hardcoding colors in templates. Preview with get_preview_url, then publish_draft_theme when it looks right."
+          skipped.length
+            ? `The theme directory was created but ${skipped.length} file(s) were NOT written (${skipped.join(", ")}) — see files_skipped for why. The theme is incomplete until they are fixed with write_theme_file.`
+            : "Scaffold written. All design tokens live in theme.css — change them there rather than hardcoding colors in templates. Preview with get_preview_url, then publish_draft_theme when it looks right."
         );
       },
     }),
@@ -217,12 +319,22 @@ export function themeTools(ctx: ToolContext) {
         site_id: siteIdSchema,
         path: z.string().describe("Path relative to the theme root, e.g. \"functions.php\" or \"template-parts/hero.php\"."),
         theme: z.string().optional().describe("Theme stylesheet or draft id. Defaults to the active theme."),
-        max_chars: z.number().int().optional().default(80000).describe("Truncate very large files at this many characters."),
+        max_chars: z.number().int().min(1).optional().default(80000).describe("Truncate very large files at this many characters."),
       },
       handler: async ({ site_id, path, theme, max_chars }) => {
         const client = site(site_id);
         const ns = await helper(client, "read_theme_file");
         const res = await client.get<any>(`/${ns}/themes/file`, { theme, path });
+        // Binary files (fonts, images) come back base64; showing that as text helps nobody.
+        if (res.data.encoding === "base64") {
+          return ok({
+            theme: res.data.theme,
+            path: res.data.path,
+            bytes: res.data.bytes,
+            modified: res.data.modified,
+            binary: true,
+          }, "This is a binary file, so its contents are not shown. Replace it by uploading media or writing a new file rather than editing it.");
+        }
         return ok({
           theme: res.data.theme,
           path: res.data.path,
@@ -278,6 +390,9 @@ export function themeTools(ctx: ToolContext) {
         client.assertWritable("edit_theme_file");
         const ns = await helper(client, "edit_theme_file");
         const current = await client.get<any>(`/${ns}/themes/file`, { theme, path });
+        if (current.data.encoding === "base64") {
+          throw new Error(`"${path}" is a binary file and cannot be edited as text.`);
+        }
         const result = applyEdits(current.data.content, edits as EditOp[]);
         if (!result.changed) {
           return ok({ edited: false, path, report: result }, "The edits produced no change, so the file was not rewritten.");
@@ -309,7 +424,11 @@ export function themeTools(ctx: ToolContext) {
           return ok({ deleted: false, requires_confirmation: true, path, bytes: current?.data?.bytes ?? "unknown" },
             "Nothing was deleted. Re-run with confirm: true to remove this file.");
         }
-        const res = await client.request<any>(`/${ns}/themes/file`, { method: "DELETE", query: { theme, path, allow_live: allow_live_theme } });
+        // Only send the flag when it is set. On a DELETE it travels as a query
+        // string, where false becomes the string "false" — and the plugin's
+        // (bool) cast reads any non-empty string as true, silently lifting the
+        // live-theme guard on every delete.
+        const res = await client.request<any>(`/${ns}/themes/file`, { method: "DELETE", query: { theme, path, allow_live: allow_live_theme ? 1 : undefined } });
         audit({ site: client.site.id, tool: "delete_theme_file", action: "delete", target: path, outcome: "ok" });
         return ok({ deleted: true, ...res.data });
       },
@@ -351,8 +470,12 @@ export function themeTools(ctx: ToolContext) {
         const ns = await helper(client, "publish_draft_theme");
         if (!confirm) {
           const info = await client.get<any>(`/${ns}/themes/drafts`).catch(() => ({ data: null } as any));
-          return ok({ published: false, requires_confirmation: true, drafts: info.data },
-            "Publishing replaces the live theme for every visitor. Nothing changed — preview it first with get_preview_url, then re-run with confirm: true. The previous theme is backed up automatically at that point.");
+          const siteEditor = await liveSiteEditorCustomizations(client);
+          return ok({ published: false, requires_confirmation: true, drafts: info.data, live_site_editor_customizations: siteEditor },
+            "Publishing replaces the live theme for every visitor. Nothing changed — preview it first with get_preview_url, then re-run with confirm: true. The previous theme is backed up automatically at that point." +
+              (siteEditor.global_styles || siteEditor.templates.length
+                ? " Warning: the live theme has Site Editor customisations (listed above). WordPress stores those against the active theme, so the draft will not show them after publishing — bake them into the draft's theme.json and template files first (diff_global_styles shows exactly what they are)."
+                : ""));
         }
         const res = await client.post<any>(`/${ns}/themes/publish`, { theme });
         audit({ site: client.site.id, tool: "publish_draft_theme", action: "publish", target: theme ?? "(latest draft)", outcome: "ok", detail: `backup=${res.data?.backup}` });

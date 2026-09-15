@@ -62,6 +62,21 @@ const STOPWORDS = new Set([
   "site", "website", "wordpress", "wp", "make", "get", "set", "put", "use",
 ]);
 
+/**
+ * The singular and plural spellings of a word, so "categories" meets "category"
+ * and "images" meets "image". Stripping a bare "es" alone turned "images" into
+ * "imag" and "caches" into "cach", which then matched neither form.
+ */
+function wordForms(word: string): string[] {
+  const w = word.toLowerCase();
+  const forms = new Set([w, `${w}s`, `${w}es`]);
+  if (/[^aeiou]y$/.test(w)) forms.add(`${w.slice(0, -1)}ies`);
+  if (w.endsWith("ies") && w.length > 4) forms.add(`${w.slice(0, -3)}y`);
+  if (w.endsWith("es") && w.length > 4) forms.add(w.slice(0, -2));
+  if (w.endsWith("s") && !w.endsWith("ss") && w.length > 3) forms.add(w.slice(0, -1));
+  return [...forms];
+}
+
 function tokenize(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2 && !STOPWORDS.has(t));
 }
@@ -82,9 +97,8 @@ export function matchSkills(query: string): Array<Skill & { score: number }> {
   // Whole-word, but tolerant of the plural a person naturally types:
   // "photos" should match the keyword "photo", and "categories" "category".
   const hasWord = (haystack: string, word: string) => {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const stem = escaped.replace(/(?:ies|es|s)$/i, "");
-    return new RegExp(`\\b(?:${escaped}|${stem}(?:s|es|ies)?)\\b`, "i").test(haystack);
+    const pattern = wordForms(word).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    return new RegExp(`\\b(?:${pattern})\\b`, "i").test(haystack);
   };
 
   return listSkills()

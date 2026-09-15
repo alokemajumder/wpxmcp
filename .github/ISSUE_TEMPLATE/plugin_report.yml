@@ -6,14 +6,16 @@ body:
     attributes:
       value: |
         The companion plugin is optional and only needed for WP-CLI, SQL, theme files,
-        unregistered meta, options, theme mods, snippets and editable fields.
-        Please run `test_site` first — it reports whether the plugin is active.
+        the error log, cache purges, profiling, developer introspection, plugin settings
+        and admin screens, unregistered meta, options, snippets and editable fields.
+        Please run `test_site` first — it reports whether the plugin is active — and
+        include the plugin version: tools added in 2.0.0 need the 2.0.0 plugin.
 
   - type: input
     id: wp
     attributes:
-      label: WordPress and PHP versions
-      placeholder: "WordPress 6.7, PHP 8.2"
+      label: WordPress, PHP and companion plugin versions
+      placeholder: "WordPress 6.7, PHP 8.2, wpxmcp Helper 2.0.0"
     validations:
       required: true
 
@@ -29,6 +31,10 @@ body:
         - Editable fields
         - Code snippets
         - Post meta or options
+        - Error log, cache purge, security or backup status
+        - Profiling (profile_url, get_template_for_url)
+        - Developer introspection (registry, options, database)
+        - Plugin settings or wp-admin screens
         - Something else
     validations:
       required: true

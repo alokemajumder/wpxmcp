@@ -1,96 +1,44 @@
 ---
 name: everyday-tasks
-title: Everyday site management for a non-technical owner
-description: How to carry out the things a site owner actually asks for — publishing, menus, homepage, images, comments, updates — safely and in plain language.
-keywords: publish, post, blog, page, menu, homepage, image, photo, comment, spam, update, plugin, backup, change, edit, add, remove, launch, website, owner, client, beginner, picture, upload, publish post, new page, navigation, front page, moderate
+title: Everyday site management for a site owner
+description: Use for routine owner requests — change wording on a page, menus, homepage, images, comments, users, site title, plugin updates, undoing a change — done safely and explained in plain language.
+keywords: change text, edit page, fix typo, update prices, menu, navigation, add to menu, homepage, front page, photo, image, picture, upload, alt text, comment, comments, spam, moderate, turn off comments, close comments, add user, new user, site title, tagline, logo, update plugins, plugin updates, undo, revert, restore, old version, owner, client, beginner, typo, fix a typo
 ---
 
-## Who this is for
+## When this applies
 
-The person asking is the site's owner, not a developer. They will describe outcomes ("put the new prices up", "the contact page is wrong") rather than mechanisms. Your job is to translate that into the right operations, do them safely, and report back in their language.
+The person owns or runs the site and describes outcomes ("the prices are wrong", "turn off comments"). New articles: `content-publishing`. Site down: `site-down`. Looks and colors: `design`.
 
-## How to work with them
+## Rules
 
-**Confirm what they mean before writing.** "The pricing page" might be `/pricing/`, a section of the homepage, or a page they forgot exists. Use `find_content_by_url` if they give a link, `get_content_by_slug` or `search_site` if they give a name, and **say which page you found** before changing it.
+1. Confirm the target before writing: resolve links with `find_content_by_url`, names with `search_site`, and say which page you found.
+2. Show, then change: quote the current value and the proposed one in one sentence for anything visitors see.
+3. Change the smallest thing: `update_content` with `edits`, never a full-body rewrite. If an edit "does not appear", the wording differs from what they said: ask, do not guess.
+4. Before updates, theme changes or anything bulk: `backup_status`, and say plainly if there is no recent backup.
+5. Explain results in their terms ("comments are off on the 14 News posts"), not field names.
+6. Trash, never permanently delete, unless they explicitly ask and understand it cannot be undone.
 
-**Show, then change.** For anything user-visible, read the current value back to them first: "Right now it says *Pro — $39/month*. Change that to $49?" One sentence, and it prevents most mistakes.
+## Procedure
 
-**Draft by default, publish on request.** `create_content` creates drafts deliberately. Offer the draft link and let them look before it goes live. Only pass `status: "publish"` when they have said to publish.
+Pick the task; each ends with the Verify step.
 
-**Explain in their terms.** Not "I set `comment_status` to `closed` on 14 posts" but "I turned off comments on the 14 posts in the News category." Mention the technical name only if they will need it later.
+- **Change wording**: `find_content_by_url` with `url` → `get_content` with `id` and `type` → `update_content` with `id`, `type` and `edits: [{"find": "…", "replace": "…"}]`. If `get_content_meta` with `id` shows a `builder_hint`, load `page-builders` instead.
+- **Add a menu link**: `list_menus`; then `add_menu_item` with `menu_id`, `title`, `type: "post_type"`, `object: "page"`, `object_id`. If `list_menus` is empty on a block theme, the menu is a `wp_navigation` post: `list_content` with `type: "wp_navigation"` and `full_content: true`, then add `<!-- wp:navigation-link {"label":"About","type":"page","id":12,"url":"/about/","kind":"post-type"} /-->` with `update_content` with `type: "wp_navigation"` and `edits` (a `<!-- wp:page-list /-->` lists all pages automatically; replacing it switches to a hand-picked menu).
+- **Change the homepage**: `get_site_settings`; `update_site_settings` with `show_on_front: "page"` and `page_on_front: {id}` (and `page_for_posts` for the blog). Confirm first; it changes what every visitor sees.
+- **Add or replace an image**: `create_media` with `file_path` or `url` and `alt_text` describing what the image shows; `set_as_featured_for` for a featured image. Missing alt text across the library: `audit_media`, then `update_media` with `id` and `alt_text`.
+- **Clear the comment queue**: `list_comments` with `status: "hold"`; summarize genuine vs spam; `moderate_comments` with `ids` and `action: "approve"` or `action: "spam"`.
+- **Turn off comments**: on existing posts, `bulk_update_content` with `filter: {"before": "2026-01-01T00:00:00"}` and `changes: {"comment_status": "closed"}` (preview, then `confirm_token`). For new content, `update_site_settings` with `default_comment_status: "closed"`. To close posts automatically after N days, `set_option` with `name: "close_comments_for_old_posts"`, `value: 1` and `set_option` with `name: "close_comments_days_old"`, `value: 30`.
+- **Site title, tagline, icon**: `update_site_settings` with `title`, `description` or `site_icon` (attachment id). Logo: `set_theme_mod` with `key: "custom_logo"` and `value: {attachment id}` on classic themes; block themes use the Site Logo block.
+- **Add a person**: `list_roles`; `create_user` with `username`, `email`, a long random `password` and the lowest role that works (`roles: ["editor"]` for content, never administrator unless asked). Share the password out of band.
+- **Update plugins**: `backup_status` → `site_info` (pending updates) → one at a time `run_wp_cli` with `command: "plugin update {slug}"` → check the homepage and one key page after each. WordPress core updates are not available through these tools: point the owner to Dashboard → Updates.
+- **Change a plugin setting**: `inspect_plugin` with `plugin` (its settings, options and admin pages) → read with `get_plugin_settings` with `plugin` and `option`, or `admin_page` with `url_or_page` → write with `update_plugin_settings` with `plugin`, `option` and `changes`, or `submit_admin_form` with `page` and `changes` (both preview first, then `confirm_token`). Undo: `restore_plugin_settings` with `option`.
+- **Undo a content change**: `list_revisions` with `id` → `restore_revision` with `id` and `revision_id` (the current version is saved as a revision first). Trashed item: `update_content` with `id` and `status: "draft"`.
+- **"I changed it but nothing changed"**: `purge_cache` with `scope: "url"` and `url`; if still stale, load `troubleshooting`.
 
-**Say what you cannot see.** If a caching plugin might be hiding a change, say so and check with `get_page_html` rather than claiming success.
+## Verify
 
-## The tasks that come up most
+`get_page_html` with `url` and `mode: "text"` (or `mode: "summary"` for images and titles) shows the change as a visitor sees it. Drafts are invisible to it; use `get_content` with `raw: false`.
 
-### Publish a post or page
-```
-create_content  type: "post", title, content        → a draft
-get_content_summary                                  → read it back to them
-update_content  id, status: "publish"                → only when they say so
-```
-Content is Gutenberg block markup — load the `gutenberg` skill before writing any. Offer to add a featured image; posts without one look unfinished in most themes.
+## Report back
 
-### Change wording on an existing page
-```
-find_content_by_url  url                             → confirm which page
-get_content          id                              → read the current wording
-update_content       id, edits: [{find, replace}]    → change only that phrase
-get_page_html        url, mode: "summary"            → confirm it is live
-```
-Always use `edits`, never resend the whole page. If the edit reports "does not appear", the wording differs from what they told you — ask, do not guess.
-
-### Add something to the navigation menu
-```
-list_menus                                           → which menu, which location
-add_menu_item  menu_id, title, type: "post_type", object: "page", object_id
-```
-If `list_menus` is empty the theme is probably a block theme, where navigation lives in a template — say so rather than creating a menu nothing displays.
-
-### Change the homepage
-```
-get_site_settings                                    → show_on_front, page_on_front
-update_site_settings  show_on_front: "page", page_on_front: <id>
-```
-This changes what every visitor sees first. Confirm before doing it, and check the result.
-
-### Add images
-```
-create_media  file_path or url, alt_text             → always write alt text
-update_content  id, featured_media: <attachment id>
-```
-Alt text is not optional: it is what a blind visitor hears and what search engines read. Write a real description ("a red bicycle against a brick wall"), never "image" or the filename.
-
-### Clear the comment queue
-```
-list_comments  status: "hold"                        → what is waiting
-moderate_comments  ids, action: "approve" | "spam"
-```
-Summarise before acting: "12 waiting — 9 look like genuine questions, 3 are spam link-drops. Approve the 9?"
-
-### Tidy up SEO
-```
-audit_content  type: "post"                          → what is actually missing
-```
-Fix the highest-impact items first: missing titles, missing meta descriptions on pages that get traffic, missing alt text. Load the `seo-audit` skill for the per-plugin field names.
-
-### Update plugins
-Updates fix security holes, and occasionally break things. Before updating anything on a live site:
-1. `list_plugins` — show what is out of date.
-2. Ask whether they have a backup or a staging copy. If not, **say plainly that an update can break the site and there is no undo from here.**
-3. Update one at a time, checking `get_page_html` after each.
-
-Never bulk-update a live site without that conversation.
-
-## Things to refuse gently
-
-Some requests are reasonable but need a human decision. Do the safe part, explain the rest:
-
-- **"Delete all the old posts"** — show what matches first, trash rather than destroy, and let them confirm the list.
-- **"Make it look like [another site]"** — copying a design is a real project, not a tool call. Offer to build a theme, and load the `design` and `classic-theme` skills.
-- **"Fix my site, it's broken"** — diagnose before touching anything: `test_site`, then `site_info`, then the `troubleshooting` skill. Report what is wrong before proposing a fix.
-- **Anything on a live site with no backup** — say so once, clearly, then proceed if they still want it. It is their site.
-
-## What "like a pro" actually means here
-
-A professional would: check before changing, change the smallest thing that works, verify on the front end, and leave the site editable by whoever comes next. Registering fields with `register_fields` as you build, writing real alt text, and keeping content in the database rather than hardcoded in templates are what make the difference six months later.
+One or two sentences in plain language: what changed, where, whether it is live, and anything they must do (activate a snippet, check a draft, take a backup). Mention cache delays if `purge_cache` reported a CDN `hit`.

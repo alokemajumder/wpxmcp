@@ -22,8 +22,17 @@ Researched August 2026. Facts verified against each project's repository; capabi
 | **SQL** | ✅ guarded | ❌ | ❌ | ✅ | ❌ | ✅ |
 | **Dry-run before destruction** | ✅ | n/a | ❌ | ❌ | ❌ | ✅ |
 | **Abilities API support** | ✅ as a client | ✅ that *is* the project | ❌ | ❌ | ❌ | ✅ |
-| **Tools** | 117 | Whatever registers abilities | ~20 | 43 | ~40 | — |
+| **MCP protocol** | 2026-07-28, plus 2025-era clients on the same endpoint | — | — | — | — | — |
+| **Error log and diagnostics** | ✅ grouped, attributed to plugin/theme (plugin) | — | — | — | — | — |
+| **Per-request profiling** | ✅ queries, template, HTTP calls, warnings (plugin) | — | — | — | — | — |
+| **Security audit** | ✅ outside-in probes + WPVulnerability lookups | — | — | — | — | — |
+| **SEO metadata across SEO plugins** | ✅ Yoast, Rank Math, AIOSEO, SEOPress, The SEO Framework | — | — | — | — | — |
+| **Fleet report across sites** | ✅ one call, in parallel | — | — | — | — | — |
+| **Operate installed plugins' settings and admin screens** | ✅ previewed, backed up (plugin) | — | — | — | — | — |
+| **Tools** | 150 | Whatever registers abilities | ~20 | 43 | ~40 | — |
 | **Cost** | Free | Free | Free | Free / paid | Free | Paid |
+
+— in the rows added for 2.0.0 means not verified for that project, not that it is missing. "(plugin)" marks capabilities that need the wpxmcp companion plugin.
 
 ## What this means in practice
 
@@ -43,9 +52,9 @@ wpxmcp works against **any WordPress 6.0+ site today**, manages many sites throu
 
 ## Is it a remote MCP server, or a plugin?
 
-**It is a remote MCP server.** wpxmcp runs on Cloudflare Workers (or locally over stdio) and talks to WordPress over its public REST API. Your sites need nothing installed for **93 of the 117 tools**.
+**It is a remote MCP server.** wpxmcp runs on Cloudflare Workers (or locally over stdio) and talks to WordPress over its public REST API. Your sites need nothing installed for **113 of the 150 tools**.
 
-The remaining 24 exist because **WordPress itself provides no API for them** — not because of a design shortcut here. That claim is worth checking rather than taking on trust, so here is the evidence:
+The remaining 37 exist because **WordPress itself provides no API for them** — not because of a design shortcut here. That claim is worth checking rather than taking on trust, so here is the evidence:
 
 | Capability | What core WordPress offers | Verified against |
 | --- | --- | --- |
@@ -54,7 +63,12 @@ The remaining 24 exist because **WordPress itself provides no API for them** —
 | Run WP-CLI | No route. WP-CLI is a separate binary that expects shell access. | — |
 | Run SQL | No route, by design. | — |
 | Meta without `show_in_rest` | Core **silently discards** it. This is most page-builder and ACF data. | `register_post_meta` semantics |
-| Options, theme mods, Site Health | Not exposed over REST. | REST API Handbook |
+| Options, theme mods, Site Health | `/wp/v2/settings` exposes only settings registered with `show_in_rest`; arbitrary options, theme mods and the Site Health *direct* tests are not exposed. Core does expose the async Site Health tests at `wp-site-health/v1`, which wpxmcp uses without the plugin. | REST API Handbook |
+| PHP error log | No route. The log is a file on the server's disk (and should never be publicly downloadable). | — |
+| Per-request profiling (queries, hooks, template) | No route. Query timing needs `SAVEQUERIES` and hooks inside the request being measured. | — |
+| Page-cache purges | Core has no page cache and no purge API; each cache plugin or host exposes its own PHP functions. | — |
+| Registered hooks, cron, shortcodes, option weight | No route for hooks, shortcodes or autoload sizes. | — |
+| Plugin settings screens and admin forms | wp-admin pages are server-rendered screens, not REST resources; many plugins keep settings only there. | — |
 
 **Could the Abilities API replace it?** No — and this is checked against a live install, not the documentation. The Abilities API **is now in WordPress core** (verified on 7.1: `wp-includes/abilities-api/`, serving `wp-abilities/v1`). But core registers **exactly three abilities**, all read-only: `core/get-site-info`, `core/get-user-info` and `core/get-environment-info`. None touches WP-CLI, SQL, theme files or arbitrary meta. It is an excellent way to reach *plugin-registered* capabilities — which is why wpxmcp is a client of it — and no substitute for the routes core simply does not have.
 
@@ -70,13 +84,13 @@ The one place they meet is the Abilities API, which wpxmcp calls directly at `wp
 
 Install it only if you want what is in that table. Nothing degrades if you do not, and every tool that needs it says so by name and tells you how to install it — rather than failing with a confusing 404.
 
-**Works against a stock WordPress install, nothing added (93 tools):**
-posts · pages · every custom post type · categories · tags · custom taxonomies · media and uploads · users · comments · plugin install/activate/delete · theme listing · menus and menu items · widgets and sidebars · block templates · global styles · reusable blocks · site settings · revisions · rendered page HTML · search · the raw `rest_api` escape hatch · the Abilities API client
+**Works against a stock WordPress install, nothing added (113 tools):**
+posts · pages · every custom post type · categories · tags · custom taxonomies · media and uploads · users · comments · plugin install/activate/delete · theme listing and WordPress.org theme search · menus and menu items · widgets and sidebars · block templates · global styles and style variations · Site Editor diffs and template resets · theme.json validation · accessibility checks · reusable blocks and patterns · site settings · revisions · rendered page HTML · search · SEO metadata · site-wide SEO checks · link checks and internal-link reports · content inventory and calendar · fleet report · the outside-in half of the security audit · the raw `rest_api` escape hatch · the Abilities API client
 
-**Needs the [companion plugin](../wp-plugin/wpxmcp-helper) (24 tools):**
-WP-CLI · SQL · theme files and the draft/preview/publish workflow · theme activation and installation · unregistered post meta · options · theme mods · Site Health and database size · code snippets · editable fields
+**Needs the [companion plugin](../wp-plugin/wpxmcp-helper) (37 tools):**
+WP-CLI · SQL · theme files and the draft/preview/publish workflow · theme activation and installation · options · Site Health and database size · code snippets · editable fields · the PHP error log · cache purges · backup status · request profiling and template resolution · registry, options and database introspection · options cleanup · inspecting installed plugins, their settings and their wp-admin screens
 
-Four further tools (`site_info`, `get_content_meta`, `list_roles`, `discover_abilities`) work either way and simply return more when the plugin is present, saying which parts they could not see.
+Eleven further tools (marked ➕ in the [tool reference](TOOLS.md)) work either way and return more when the plugin is present — `site_info`, `get_content_meta`, `security_audit` and `seo_site_check` among them — saying which parts they could not see.
 
 ## Which to run
 
@@ -84,6 +98,7 @@ Four further tools (`site_info`, `get_content_meta`, `list_roles`, `discover_abi
 | --- | --- |
 | Content, media, taxonomies, users, comments, menus, widgets — the everyday work | **The MCP server alone.** Nothing on the site. |
 | Theme building, WP-CLI, SQL, page-builder meta, editable fields | **MCP server + companion plugin.** |
+| Diagnosing errors and slow pages, purging caches, operating a plugin's settings screens | **MCP server + companion plugin.** |
 | Only plugin-registered abilities on WordPress 6.9+ | Consider the official [MCP Adapter](https://github.com/WordPress/mcp-adapter) instead — and note wpxmcp can call those abilities too. |
 
 The plugin adds REST routes under `wpxmcp/v1`, every one of them requiring an authenticated administrator. Full detail: [docs/COMPANION_PLUGIN.md](COMPANION_PLUGIN.md).

@@ -19,4 +19,5 @@
 - [ ] Destructive behaviour previews first and requires a confirmation token
 - [ ] Writes call `audit({...})`
 - [ ] No `node:fs`, `node:path`, `process` or `Buffer` added under `src/lib/` or `src/tools/`
-- [ ] `docs/TOOLS.md` updated if tools changed
+- [ ] `docs/TOOLS.md` regenerated with `npm run build && npm run docs:tools` if tools changed (never edited by hand)
+- [ ] New or changed playbooks pass `npm test` (skills accuracy and routing) and `src/generated/skills.ts` is committed

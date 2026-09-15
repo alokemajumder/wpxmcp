@@ -42,8 +42,12 @@ await expectOk("update_content", { id: ID, edits: [{ find: "<strong>ONE</strong>
 await expectRefused("update_content", { id: ID, edits: [{ find: "ABSENT", replace: "x" }] }, /does not appear/, "update_content(miss)");
 await expectRefused("update_content", { id: ID, content: "x", edits: [{ find: "a", replace: "b" }] }, /not both/, "update_content(both)");
 await expectRefused("update_content", { id: ID }, /No changes/, "update_content(empty)");
-await expectOk("get_content_by_slug", { slug: "pricing" }, (d) => d.match_count >= 1 ? null : "pricing page not found by slug");
-await expectOk("find_content_by_url", { url: "http://127.0.0.1:8090/?page_id=5" }, (d) => d.found ? null : "did not resolve ?page_id=");
+// Any published page will do; ids and slugs differ between installs, so never hardcode one.
+const PAGE = J(await call("list_content", { type: "page", status: "publish", per_page: 1, fields: ["id", "slug"] })).items?.[0] ?? {};
+const PAGE_ID = PAGE.id;
+if (!PAGE_ID) problems.push("setup: the site has no published page to resolve by ?page_id=");
+await expectOk("get_content_by_slug", { slug: PAGE.slug }, (d) => d.match_count >= 1 ? null : `page "${PAGE.slug}" not found by slug`);
+await expectOk("find_content_by_url", { url: "http://127.0.0.1:8090/?page_id=" + PAGE_ID }, (d) => d.found ? null : "did not resolve ?page_id=");
 await expectOk("find_content_by_url", { url: "http://127.0.0.1:8090/?p=1" }, (d) => d.found ? null : "did not resolve ?p=");
 await expectOk("find_content_by_url", { url: "http://127.0.0.1:8090/nope-does-not-exist/" }, (d) => d.found === false ? null : "claimed to find a missing URL");
 await expectOk("find_content_by_url", { url: "http://127.0.0.1:8090/?p=" + ID, update: true, title: "Audit subject renamed" },
@@ -136,7 +140,7 @@ const MENU = J(menu).id;
 await expectOk("list_menus", {}, (d) => d.menus?.length ? null : "no menus");
 const mi = await expectOk("add_menu_item", { menu_id: MENU, title: "Home", type: "custom", url: "http://127.0.0.1:8090/" });
 const MI = J(mi).id;
-const mi2 = await expectOk("add_menu_item", { menu_id: MENU, title: "Pricing", type: "post_type", object: "page", object_id: 5 });
+const mi2 = await expectOk("add_menu_item", { menu_id: MENU, title: "Page", type: "post_type", object: "page", object_id: PAGE_ID });
 await expectOk("get_menu", { id: MENU }, (d) => d.item_count === 2 ? null : `expected 2 items, got ${d.item_count}`);
 await expectOk("update_menu_item", { id: MI, title: "Home renamed" });
 await expectOk("reorder_menu_items", { items: [{ id: MI, menu_order: 2 }, { id: J(mi2).id, menu_order: 1 }] },
@@ -163,12 +167,12 @@ section("site + intelligence");
 await expectOk("get_site_settings", {}, (d) => d.settings?.title ? null : "no site title");
 await expectOk("update_site_settings", { description: "Audited tagline" }, (d) => d.changes?.length ? null : "no changes reported");
 await expectOk("site_info", { include_health: true }, (d) => d.php?.version ? null : "no php version");
-await expectOk("get_page_html", { url: "/?page_id=5", mode: "summary" }, (d) => d.status === 200 ? null : `status ${d.status}`);
+await expectOk("get_page_html", { url: "/?page_id=" + PAGE_ID, mode: "summary" }, (d) => d.status === 200 ? null : `status ${d.status}`);
 await expectOk("get_page_html", { url: "/", mode: "head" });
 await expectOk("get_page_html", { url: "/", mode: "text", max_chars: 500 });
 await expectOk("search_site", { query: "pricing" });
 await expectOk("list_revisions", { id: ID });
-await expectOk("get_content_meta", { id: 5 });
+await expectOk("get_content_meta", { id: PAGE_ID });
 await expectOk("set_content_meta", { id: ID, meta: { audit_key: "audit_value" } },
   (d) => d.written?.audit_key === "audit_value" ? null : "meta not written");
 await expectOk("get_content_meta", { id: ID, include_protected: true },
@@ -190,7 +194,7 @@ await expectOk("run_wp_cli", { command: "db tables" });
 await expectOk("run_wp_cli", { command: "transient get doesnotexist" });
 await expectOk("run_wp_cli", { command: "maintenance-mode status" });
 await expectRefused("run_wp_cli", { command: "db drop --yes" }, /allowlist/, "cli(db drop)");
-await expectRefused("run_wp_cli", { command: "eval phpinfo();" }, /WPX_ALLOW_EVAL|metacharacters/, "cli(eval)");
+await expectRefused("run_wp_cli", { command: "eval phpinfo();" }, /allowlist|metacharacters/, "cli(eval)");
 await expectRefused("run_wp_cli", { command: "option update siteurl http://evil" }, /protected/, "cli(protected option)");
 
 await expectOk("execute_sql_query", { query: "SELECT ID FROM wp_posts LIMIT 3" }, (d) => Array.isArray(d.rows) ? null : "no rows");
@@ -265,7 +269,8 @@ await expectOk("delete_skill", { name: "audit-skill" }, (d) => d.deleted ? null 
 await call("delete_content", { id: ID, force: true, confirm: true });
 
 /* ────────────────────────── REPORT ────────────────────────── */
-const all = JSON.parse(fs.readFileSync("audit/all-tools.json", "utf8"));
+// The live tool list, so coverage can never be measured against a stale snapshot.
+const all = (await client.listTools()).tools.map((t) => t.name);
 const uncovered = all.filter((t) => !R.covered.has(t));
 console.log(`\n${"═".repeat(60)}`);
 console.log(`Tools covered : ${R.covered.size}/${all.length}`);

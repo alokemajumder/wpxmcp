@@ -5,13 +5,13 @@
  * client's configuration file. Set them with `wrangler secret put`, and see
  * docs/DEPLOY_CLOUDFLARE.md for the full walkthrough.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { handleMcpRequest } from "./lib/http-transport.js";
 import { setPlatform, createMemoryAudit, type AuditEntry, type Platform } from "./lib/platform.js";
 import { SiteRegistry } from "./lib/registry.js";
 import { loadConfig } from "./lib/config.js";
-import { registerTools, type ToolContext } from "./lib/tooling.js";
-import { buildToolset, VERSION, INSTRUCTIONS } from "./toolset.js";
+import type { ToolContext } from "./lib/tooling.js";
+import { createWpxServer } from "./lib/server.js";
+import { VERSION } from "./toolset.js";
 
 export interface Env {
   /** JSON array or object of site definitions. The usual way to configure several sites. */
@@ -61,6 +61,20 @@ function installWorkerPlatform(env: Env): Platform {
       return `wpxmcp-confirm:${env.WPX_AUTH_TOKEN ?? ""}`;
     },
 
+    // With the optional KV binding, a spent confirmation token is refused by every
+    // isolate, not only the one that accepted it. KV is eventually consistent, so
+    // this narrows the replay window rather than closing it; the signature and the
+    // ten-minute expiry still apply either way.
+    spentTokens: env.WPX_AUDIT
+      ? {
+          has: async (hash: string) => (await env.WPX_AUDIT!.get(`spent:${hash}`)) !== null,
+          add: async (hash: string, expiresAt: number) => {
+            const ttl = Math.max(60, Math.ceil((expiresAt - Date.now()) / 1000));
+            await env.WPX_AUDIT!.put(`spent:${hash}`, "1", { expirationTtl: ttl });
+          },
+        }
+      : undefined,
+
     // No readLocalFile: a remote Worker has no access to the caller's disk.
     // create_media explains this and points at `url` / `base64_data` instead.
 
@@ -80,8 +94,8 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
 
   const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID",
-    "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+    "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -104,7 +118,8 @@ function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-function authorize(request: Request, env: Env): Response | null {
+/** `cors` rides on the refusals too, or a browser client cannot even read why it was refused. */
+function authorize(request: Request, env: Env, cors: Record<string, string>): Response | null {
   if (!env.WPX_AUTH_TOKEN) {
     // Deployed without a token, this Worker would let anyone drive the WordPress
     // sites whose credentials it holds. Refuse rather than run wide open.
@@ -113,7 +128,7 @@ function authorize(request: Request, env: Env): Response | null {
         error: "This deployment has no WPX_AUTH_TOKEN set, so it refuses every request.",
         fix: "Generate a long random token and set it as a Worker secret: `openssl rand -hex 32 | npx wrangler secret put WPX_AUTH_TOKEN`. Then send it as `Authorization: Bearer <token>`.",
       }),
-      { status: 503, headers: { "Content-Type": "application/json" } }
+      { status: 503, headers: { "Content-Type": "application/json", ...cors } }
     );
   }
 
@@ -126,7 +141,7 @@ function authorize(request: Request, env: Env): Response | null {
         error: "Unauthorized.",
         detail: "Send the deployment's shared secret as `Authorization: Bearer <token>`.",
       }),
-      { status: 401, headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="wpxmcp"' } }
+      { status: 401, headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="wpxmcp"', ...cors } }
     );
   }
   return null;
@@ -149,6 +164,7 @@ export default {
           version: VERSION,
           runtime: "cloudflare-workers",
           transport: "streamable-http (stateless)",
+          protocol: ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"],
           endpoint: "/mcp",
           auth_configured: Boolean(env.WPX_AUTH_TOKEN),
         }),
@@ -163,24 +179,18 @@ export default {
       );
     }
 
-    const denied = authorize(request, env);
+    const denied = authorize(request, env, cors);
     if (denied) return denied;
 
     installWorkerPlatform(env);
 
     return handleMcpRequest(request, {
       headers: cors,
-      timeoutMs: 120000,
+      onerror: (error) => console.error(`wpxmcp: ${error.message}`),
       createServer: () => {
         const registry = new SiteRegistry(loadConfig(env as unknown as Record<string, string | undefined>));
         const ctx: ToolContext = { registry };
-
-        const server = new McpServer(
-          { name: "wpxmcp", version: VERSION },
-          { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
-        );
-        registerTools(server, buildToolset(ctx));
-        return server;
+        return createWpxServer(ctx);
       },
     });
   },

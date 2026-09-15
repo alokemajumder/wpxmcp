@@ -50,10 +50,40 @@ export interface ResolvedConfig {
   source: string;
 }
 
-function normalizeUrl(raw: string): string {
+function normalizeUrl(raw: string, siteId: string): string {
   let u = raw.trim();
   if (!/^https?:\/\//i.test(u)) u = "https://" + u;
-  return u.replace(/\/+$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(u);
+  } catch {
+    throw new Error(`Site "${siteId}" has an invalid url "${raw}". Use the site's home address, e.g. https://example.com.`);
+  }
+  // The REST prefix is added per request, so a pasted ".../wp-json" would double
+  // up. A query string or fragment has no meaning on a base URL either.
+  const pathname = parsed.pathname.replace(/\/+$/, "").replace(/\/wp-json$/i, "");
+  return `${parsed.origin}${pathname}`;
+}
+
+/**
+ * Reads a boolean that may arrive as a JSON boolean or as a string from an
+ * environment variable. `Boolean("false")` is true, which would silently make a
+ * site meant to be read-only writable.
+ */
+function parseBool(value: unknown, fallback: boolean, field: string, siteId: string): boolean {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const s = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(s)) return true;
+  if (["false", "0", "no", "off"].includes(s)) return false;
+  throw new Error(`Site "${siteId}" has ${field}: ${JSON.stringify(value)}, which is not a boolean. Use true or false.`);
+}
+
+/** JSON.parse messages quote the offending input, which may be a password. Keep only the position. */
+function describeJsonError(e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e);
+  const position = /position (\d+)/.exec(message);
+  return position ? `invalid JSON near position ${position[1]}` : "invalid JSON";
 }
 
 function slugify(input: string): string {
@@ -72,8 +102,15 @@ function coerceSite(raw: any, fallbackId: string): SiteConfig {
   if (!url || typeof url !== "string") {
     throw new Error(`Site "${fallbackId}" is missing a "url".`);
   }
-  const normalized = normalizeUrl(url);
-  const id = String(raw.id ?? fallbackId ?? slugify(normalized));
+  const id = String(raw.id ?? fallbackId ?? slugify(url));
+  const normalized = normalizeUrl(url, id);
+  const timeoutMs = Number(raw.timeoutMs ?? raw.timeout_ms ?? 60000);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    // setTimeout treats NaN as ~1ms, so every request would time out at once.
+    throw new Error(`Site "${id}" has timeoutMs: ${JSON.stringify(raw.timeoutMs ?? raw.timeout_ms)}, which is not a positive number of milliseconds.`);
+  }
+  let restPrefix: string = raw.restPrefix ?? raw.rest_prefix ?? "/wp-json";
+  if (!restPrefix.startsWith("/")) restPrefix = `/${restPrefix}`;
   return {
     id,
     name: String(raw.name ?? raw.label ?? id),
@@ -81,12 +118,12 @@ function coerceSite(raw: any, fallbackId: string): SiteConfig {
     username: raw.username ?? raw.user ?? undefined,
     appPassword: raw.appPassword ?? raw.app_password ?? raw.password ?? undefined,
     bearerToken: raw.bearerToken ?? raw.bearer_token ?? raw.token ?? undefined,
-    restPrefix: raw.restPrefix ?? raw.rest_prefix ?? "/wp-json",
+    restPrefix,
     headers: raw.headers ?? undefined,
-    allowInsecureTLS: Boolean(raw.allowInsecureTLS ?? raw.allow_insecure_tls ?? false),
-    timeoutMs: Number(raw.timeoutMs ?? raw.timeout_ms ?? 60000),
+    allowInsecureTLS: parseBool(raw.allowInsecureTLS ?? raw.allow_insecure_tls, false, "allowInsecureTLS", id),
+    timeoutMs,
     helperNamespace: raw.helperNamespace ?? raw.helper_namespace ?? "wpxmcp/v1",
-    writable: raw.writable === undefined ? true : Boolean(raw.writable),
+    writable: parseBool(raw.writable, true, "writable", id),
   };
 }
 
@@ -137,8 +174,14 @@ function parseSiteCollection(parsed: any, source: string): { sites: SiteConfig[]
 
 function fromInlineJson(env: NodeJS.ProcessEnv) {
   if (!env.WPX_SITES) return null;
+  let parsed: unknown;
   try {
-    return parseSiteCollection(JSON.parse(env.WPX_SITES), "WPX_SITES");
+    parsed = JSON.parse(env.WPX_SITES);
+  } catch (e) {
+    throw new Error(`Could not parse WPX_SITES: ${describeJsonError(e)}.`);
+  }
+  try {
+    return parseSiteCollection(parsed, "WPX_SITES");
   } catch (e: any) {
     throw new Error(`Could not parse WPX_SITES: ${e.message}`);
   }
@@ -146,8 +189,14 @@ function fromInlineJson(env: NodeJS.ProcessEnv) {
 
 function readJsonFile(file: string, source: string) {
   const text = fs.readFileSync(file, "utf8");
+  let parsed: unknown;
   try {
-    return parseSiteCollection(JSON.parse(text), source);
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Could not parse ${file}: ${describeJsonError(e)}.`);
+  }
+  try {
+    return parseSiteCollection(parsed, source);
   } catch (e: any) {
     throw new Error(`Could not parse ${file}: ${e.message}`);
   }

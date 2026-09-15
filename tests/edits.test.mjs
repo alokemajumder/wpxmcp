@@ -15,6 +15,15 @@ test("an ambiguous edit fails rather than guessing", () => {
   );
 });
 
+test("an ambiguous regex edit fails too, instead of replacing only the first match", () => {
+  assert.throws(
+    () => applyEdits("<p>$10</p><p>$20</p>", [{ find: "\\$\\d+", replace: "$0", regex: true }]),
+    /ambiguous/
+  );
+  const all = applyEdits("<p>$10</p><p>$20</p>", [{ find: "\\$\\d+", replace: "$0", regex: true, all: true }]);
+  assert.equal(all.applied[0].occurrences, 2);
+});
+
 test("all:true replaces every occurrence", () => {
   const result = applyEdits("<p>a</p><p>a</p>", [{ find: "<p>a</p>", replace: "<p>b</p>", all: true }]);
   assert.equal(result.content, "<p>b</p><p>b</p>");
