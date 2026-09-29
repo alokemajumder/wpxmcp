@@ -42,7 +42,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
-    "undici": "^7.2.0",
+    "undici": "^7.29.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
@@ -51,7 +51,7 @@
     "@types/node": "^26.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "wrangler": "^4.131.0"
+    "wrangler": "^4.143.1"
   },
   "repository": {
     "type": "git",
